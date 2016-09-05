@@ -320,7 +320,7 @@ def filter_GCP_by_warp_error(GCPs,errorThres):
     
 def calc_azimuth(obs_vec):
     ''' Calculates the azimuth navigation heading between two positions
-PolynomialWarp(rows,cols,thetaX,thetaY)
+
     Parameters
     ----------   
     lon_0, lat_0 : Initial longitude and latitude (degrees)
@@ -367,6 +367,13 @@ def GCPs_to_ASCII(GCPs,outfile):
     fid.flush()
     fid.close()
     return True
+
+def ASCII_to_GCP(infile,GCP=[]):
+
+    indata=np.genfromtxt(infile,names=True,dtype=None)
+    for data in indata:
+        GCP.append([float(data['X']),float(data['Y']),float(data['Row']),float(data['Col'])])
+    return GCP
 
 def write_transformation_vector(slaveCoords,masterCoords,outshapefile,prj):
     from osgeo import ogr
