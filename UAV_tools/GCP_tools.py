@@ -257,12 +257,35 @@ def filter_GCP_by_azimuth(GCPs,slave_geo,angleThres):
     GCPs_good=GCPs[diff<=angleThres]
     return GCPs_good
 
-def calc_vector_intersection(start1,end1,start2,end2):
+def filter_GCP_by_tranlation(GCPs,slave_geo,stdThres=2):
 
-    def ccw(A,B,C):
-        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+    # Filter GCPs based on image proximity
+    GCPs=np.asarray(GCPs)
+    if len(GCPs.shape)==1:
+        GCPs=GCPs.reshape(1,-1)
+    X_slave,Y_slave=get_map_coordinates(GCPs[:,2],GCPs[:,3],slave_geo)
+    dist=np.log(np.sqrt((X_slave-GCPs[:,0])**2+(Y_slave-GCPs[:,1])**2))
+    mean_dist=np.mean(dist)
+    std_dist=np.std(dist)
+    GCPs_good=GCPs[dist<=mean_dist+stdThres*std_dist]
+    return GCPs_good
+
+def filter_GCP_by_unique_coordinates(GCPs):
+    GCPs=np.asarray(GCPs)
+    Coord_good=[]
+    GCPs_good=[]
+    for GCP in GCPs:
+        if (GCP[0],GCP[1]) not in Coord_good:
+            Coord_good.append((GCP[0],GCP[1]))
+            GCPs_good.append(GCP)
+    return GCPs_good
+
+def calc_vector_intersection(start1,end1,start2,end2):
         
-    return ccw(start1,start2,end2) != ccw(end1,start2,end2) and ccw(start1,end1,start2) != ccw(start1,end1,end2)
+    return _ccw(start1,start2,end2) != _ccw(end1,start2,end2) and _ccw(start1,end1,start2) != _ccw(start1,end1,end2)
+
+def _ccw(A,B,C):
+    return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
 
 
 def filter_GCP_by_warp_error(GCPs,errorThres):
