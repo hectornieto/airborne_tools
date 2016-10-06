@@ -9,6 +9,158 @@ import gdal
 import numpy as np
 import cv2
 
+def collocate_image(master_file, slave_file, output_file, slave_bands=None, noData=0,
+                    dist_threshold=50, pixel_threshold=20, angle_threshold=90, 
+                    std_translation_thres=2, filter_intersect=True,
+                    search_window_size=1000, manual_GCP_file=None, transform=0,
+                    useSIFT=True, match_factor=0.75,image_to_georreference=None, bands_to_georreference=None):
+    
+    # Read the master TIR mosaic
+    masterfid=gdal.Open(master_file,gdal.GA_ReadOnly)
+    master_geo=masterfid.GetGeoTransform()
+    masterXsize=masterfid.RasterXSize
+    masterYsize=masterfid.RasterYSize
+    
+    # Set the extent for the output image equal as the master image
+    xmin,ymax=get_map_coordinates(0,0,master_geo)
+    xmax,ymin=get_map_coordinates(masterYsize,masterXsize,master_geo)
+    output_extent=(xmin,ymin,xmax,ymax)
+    
+    slavefid=gdal.Open(slave_file,gdal.GA_ReadOnly)
+    slaveCols=slavefid.RasterXSize
+    slaveRows=slavefid.RasterYSize
+    slave_geo=slavefid.GetGeoTransform()
+    slave_prj=slavefid.GetProjection()
+    if slave_bands==None:
+        slave_bands= range(slavefid.RasterCount)
+    # Get the upper and lower bounds for each tile in the input image
+    upperRows=range(0,slaveRows,search_window_size)
+    upperCols=range(0,slaveCols,search_window_size)
+    nXwindows=len(upperCols)
+    nYwindows=len(upperRows)
+    # Create the empty list with valid GCPs and count for valid GCPs
+    GCP_valid=[]
+    total=0
+    distance=0
+    azimuth=0
+    intersect=0
+    proximity=0
+    # Loop all the tiles to get the GCPs
+    for i,upperRow in enumerate(upperRows):
+        #print('Searching tiles in row %s,'%(upperRow))
+        if i>=nYwindows-1:
+            lowerRow=slaveRows
+            win_ysize=lowerRow-upperRow
+            # Last tile must fit the image size
+        else:
+            lowerRow=upperRows[i+1]
+            win_ysize=search_window_size
+        for j,upperCol in enumerate(upperCols):
+            print('Searching tile row %s, col %s'%(upperRow,upperCol))
+            if j>=nXwindows-1:
+                lowerCol=slaveCols # Last tile must fit the image size
+                win_xsize=lowerCol-upperCol
+            else:
+                lowerCol=upperCols[j+1]
+                win_xsize=search_window_size
+            xmin,ymax=get_map_coordinates(upperRow,upperCol,slave_geo)
+            xmax,ymin=get_map_coordinates(lowerRow,lowerCol,slave_geo)
+            # Get the pixel coordinates of the master image
+            xmin-=dist_threshold # THe search window has a buffer equal to the distance threshold
+            ymin-=dist_threshold # THe search window has a buffer equal to the distance threshold
+            xmax+=dist_threshold # THe search window has a buffer equal to the distance threshold
+            ymax+=dist_threshold # THe search window has a buffer equal to the distance threshold
+            upperMasterRow,upperMasterCol=np.floor(get_pixel_coordinates(xmin,ymax,master_geo)).astype(np.int16)
+            lowerMasterRow,lowerMasterCol=np.ceil(get_pixel_coordinates(xmax,ymin,master_geo)).astype(np.int16)
+            upperMasterRow=int(np.clip(upperMasterRow,0,masterYsize))# Avoid negative pixel coordinates
+            upperMasterCol=int(np.clip(upperMasterCol,0,masterXsize))# Avoid negative pixel coordinates
+            lowerMasterRow=int(np.clip(lowerMasterRow,0,masterYsize))# Avoid pixel coordinates beyond the image extent
+            lowerMasterCol=int(np.clip(lowerMasterCol,0,masterXsize))# Avoid pixel coordinates beyond the image extent
+            win_MasterXsize=int(lowerMasterCol-upperMasterCol)
+            win_MasterYsize=int(lowerMasterRow-upperMasterRow)
+            # Read the master image array and subset
+            master_scaled=masterfid.GetRasterBand(1).ReadAsArray(
+                        upperMasterCol,upperMasterRow, win_MasterXsize, 
+                        win_MasterYsize).astype(np.float)
+            master_scaled=scale_grayscale_image(master_scaled, noData=noData)
+            UL_X,UL_Y=get_map_coordinates(upperMasterRow,upperMasterCol,master_geo)
+            # Get the master subset geotransform
+            master_window_geo=(UL_X,master_geo[1],master_geo[2],UL_Y,master_geo[4],master_geo[5])
+            if master_scaled.any() == noData: # If all pixels have no data skip tile
+                continue
+            # Loop all the Principal Componets
+            GCP_region=[]
+            for band in slave_bands:
+                slave_scaled=slavefid.GetRasterBand(band+1).ReadAsArray(
+                                                    upperCol,upperRow, 
+                                                    win_xsize, win_ysize).astype(np.float)
+                if slave_scaled.any() == noData: # If all pixels have no data skip tile
+                    continue
+                slave_scaled=scale_grayscale_image(slave_scaled, noData=noData)
+                if np.any(slave_scaled)==0:
+                    continue
+                # Find features and matches
+                GCPs=find_GCPs(master_scaled,slave_scaled,master_window_geo,
+                                   UL_offset=(upperRow,upperCol),
+                                    match_factor=match_factor,useSIFT=useSIFT)
+                total+=len(GCPs)
+                if len(GCPs)>0:
+                    GCPs=filter_GCP_by_map_proximity(GCPs,slave_geo,dist_threshold)
+                    print('Found %s valid GPCs'%np.asarray(GCPs)[:,0].shape)
+                    distance+=float(np.asarray(GCPs)[:,0].size)
+                for GCP in np.asarray(GCPs).tolist():
+                    GCP_region.append(GCP)
+            if len(GCP_region) > 0:
+                if angle_threshold > 0:
+                    # Filter GCPs based on angular deviations from the mean translation direction
+                    GCP_region=filter_GCP_by_azimuth(GCP_region,slave_geo,angle_threshold)
+                    print('Filtered by angle %s GPCs'%GCP_region[:,0].shape)
+                    azimuth+=float(GCP_region[:,0].size)
+                if filter_intersect:
+                    #Filter GCPs based on whether they intersec with other GCPs   
+                    GCP_region=filter_GCP_by_intersection(GCP_region,slave_geo)
+                    print('Found %s GCPs that do not intersect' %(len(GCP_region)))
+                    intersect+=len(GCP_region)
+                if pixel_threshold > 0:
+                    # Filter GCPs based on image proximity
+                    GCP_region=filter_GCP_by_GCP_proximity(GCP_region,pixel_threshold)
+                    print('Found %s GCPs separated enough' %(len(GCP_region)))
+                    proximity+=len(GCP_region)
+                for GCP in np.asarray(GCP_region).tolist():
+                    GCP_valid.append(tuple(GCP))
+
+    nGCPs={'total':total,'distance':distance,'azimuth':azimuth,'intersect':intersect,'proximity':proximity}   
+    if std_translation_thres > 0:                
+        # Filter GCPs by removing outliers in the tranlation distance between source and destination
+        GCP_valid=filter_GCP_by_tranlation(GCP_valid,slave_geo,stdThres=std_translation_thres)
+        print('Filtered %s GCPs with normal tranlation' %(len(GCP_valid))) 
+        nGCPs['tranlation']=len(GCP_valid)
+   
+    # Remove GCPs with exactly the same map coordinates
+    GCP_valid=filter_GCP_by_unique_coordinates(GCP_valid)
+    print('Filtered %s GCPs with same coordinates' %(len(GCP_valid))) 
+    nGCPs['coordinates']=len(GCP_valid)
+
+    print(nGCPs)
+    
+    # Add manual GCPs
+    if manual_GCP_file:
+        GCP_valid=np.asarray(GCP_valid)[:,:4]
+        GCP_valid=ASCII_to_GCP(manual_GCP_file,GCP=GCP_valid.tolist())
+        slaveXCoord,slaveYCoord=get_map_coordinates(np.asarray(GCP_valid)[:,2],np.asarray(GCP_valid)[:,3],slave_geo)
+
+    outshapefile=basename(output_file)+'_Transform.shp'
+    write_transformation_vector((slaveXCoord,slaveYCoord),(np.asarray(GCP_valid)[:,0],np.asarray(GCP_valid)[:,1]),outshapefile,slave_prj)
+    
+    # Write the GCP to ascii file
+    outtxtfile=basename(output_file)+'_GCPs.txt'    
+    GCPs_to_ASCII(GCP_valid,outtxtfile)
+    # Reproject image
+    if image_to_georreference:
+        slave_file=image_to_georreference
+    warp_image_with_GCPs(slave_file,GCP_valid,output_extent,transform=transform,
+                             subsetBands=bands_to_georreference,outfile=output_file)
+
 def scale_grayscale_image(image, noData=None):
     
     if noData==None:
@@ -86,8 +238,9 @@ def compute_PCA(imageFile,pcaComponents=None,outfile=None,bandsPCA=None,normaliz
     
     return output_array,pca.explained_variance_ratio_
 
-def warp_image_with_GCPs(input_file,GCP_list,output_extent,subsetBands=None,transform=0):
-    from os.path import exists,dirname
+def warp_image_with_GCPs(input_file,GCP_list,output_extent=None,subsetBands=None,transform=0, outfile=None, data_format=2):
+    from os.path import exists,dirname, splitext
+    from glob import glob
     from os import remove
     import subprocess
     
@@ -96,17 +249,22 @@ def warp_image_with_GCPs(input_file,GCP_list,output_extent,subsetBands=None,tran
     infid=gdal.Open(input_file,gdal.GA_ReadOnly)
     prj=infid.GetProjection()
     geo=infid.GetGeoTransform()
+    rows=infid.RasterYSize
+    cols=infid.RasterXSize
     driver = gdal.GetDriverByName('GTiff')
     tempfile=dirname(input_file)+'/temp.tif'
     if exists(tempfile): 
-        remove(tempfile)
-    infid=gdal.Open(input_file,gdal.GA_ReadOnly)
-    
+        [remove(i) for i in glob(splitext(tempfile)[0]+'.*')]
+    if not output_extent:
+        xmin_out,ymax_out=get_map_coordinates(0,0,geo)
+        xmax_out,ymin_out=get_map_coordinates(rows,cols,geo)
+        output_extent=(xmin_out,ymin_out,xmax_out,ymax_out)
+
     nbands=infid.RasterCount
     if subsetBands==None:
         subsetBands=range(1,nbands+1)
     nbands=len(subsetBands)
-    ds = driver.Create(tempfile, infid.RasterXSize, infid.RasterYSize,nbands, gdal.GDT_UInt16)
+    ds = driver.Create(tempfile, cols, rows, nbands, data_format)
     for i,band in enumerate(subsetBands):
         print('Saving Band ' +str(band))
         array=infid.GetRasterBand(band).ReadAsArray()
@@ -116,16 +274,18 @@ def warp_image_with_GCPs(input_file,GCP_list,output_extent,subsetBands=None,tran
         del band
         del array
     del infid
-    
     ds.SetGCPs(GDALGCPs,prj)
-    del ds
+    ds.SetProjection(prj)
     # Run GDAL Warp
-    outfile=input_file[:-4]+'_Georref.bsq'
+    if not outfile:
+        outfile=input_file[:-4]+'_Georref.bsq'
+    if exists(outfile):
+        [remove(i) for i in glob(splitext(outfile)[0]+'.*')]
     if transform==0:
         gdal_command='gdalwarp -tps -overwrite -r bilinear -of ENVI -srcnodata 0 -dstnodata 0 -multi -tr %s %s '%(geo[1],geo[5]) +' -te %s %s %s %s '%output_extent+' "'+ tempfile + '" "'  + outfile +'"'
     else:
         gdal_command='gdalwarp -order ' +str(transform)+' -overwrite -r bilinear -of ENVI -srcnodata 0 -dstnodata 0 -multi -tr %s %s '%(geo[1],geo[5]) +' -te %s %s %s %s '%output_extent+' "'+ tempfile + '" "'  + outfile +'"'
-    
+    print(gdal_command)
     proc=subprocess.Popen(gdal_command,shell=True,stdout=subprocess.PIPE,
          stdin=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
     while True:
@@ -135,7 +295,7 @@ def warp_image_with_GCPs(input_file,GCP_list,output_extent,subsetBands=None,tran
         if out != '':
             print(out,end='')
     proc.communicate()
-    remove(tempfile)
+    #remove(tempfile)
     return True
 
 def find_GCPs(masterImage,slaveImage,masterGeo,UL_offset=(0,0),match_factor=0.75,useSIFT=False):
@@ -377,7 +537,7 @@ def create_gdal_GCPs(GCPs):
 
     gdalGCP=[]
     for i,gcp in enumerate(GCPs):
-        gdalGCP.append(gdal.GCP(gcp[0],gcp[1],0,gcp[3],gcp[2],'',str(i)))
+        gdalGCP.append(gdal.GCP(gcp[0], gcp[1],0, gcp[3], gcp[2],'',str(i)))
     return gdalGCP
 
 def GCPs_to_ASCII(GCPs,outfile):
