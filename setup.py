@@ -28,8 +28,14 @@ def read_file(filepath, root=PROJECT_ROOT):
     * `root` is the base path and it defaults to the `PROJECT_ROOT` directory.
     * `filepath` should be a relative path, starting from `root`.
     """
-    with open(os.path.join(root, filepath)) as fd:
-        text = fd.read()
+    try:
+        # Python 2.x
+        with open(os.path.join(root, filepath)) as fd:
+            text = fd.read()
+    except UnicodeDecodeError:
+        # Python 3.x
+        with open(os.path.join(root, filepath), encoding = "utf8") as fd:
+            text = fd.read()    
     return text
 
 
@@ -41,9 +47,8 @@ REQS = [
 ]
 
 setup(
-    name                  = "UAV_tools",
-    packages              = ['UAV_tools'],
-    #dependency_links      = ['http://github.com/hectornieto/pyPro4Sail/tarball/master#egg=pyPro4Sail-v1.0'],
+    name                  = "airborne_tools",
+    packages              = ['airborne_tools'],
     install_requires      = REQS,
     version               = "0.1",
     author                = "Hector Nieto",
