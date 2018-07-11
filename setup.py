@@ -43,8 +43,10 @@ LONG_DESCRIPTION = read_file("README.md")
 SHORT_DESCRIPTION = "Python tools for processing very high resolution imagery onboard an RPAS or an manned aircraft"
 REQS = [
     'numpy>=1.10',
-    'gdal','osr','sklearn'
-]
+    'gdal',
+    'osr',
+    'sklearn',
+    'pil']
 
 setup(
     name                  = "airborne_tools",
