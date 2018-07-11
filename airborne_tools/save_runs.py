@@ -108,8 +108,8 @@ def get_fligh_lines_coordinates(polygon,flight_azimuth, n_runs, separation, buff
     end_points=[]
     point_1,point_2=get_extreme_points(polygon,flight_azimuth)
     if abs(np.cos(np.radians(flight_azimuth)))==1:
-        start=np.asarray([point_1[0]-buffer_dist/2.,point_1[1]-start_acquisition])
-        end=np.asarray([point_2[0]-buffer_dist/2.,point_2[3]+start_acquisition])
+        start=np.asarray([point_1[0] + separation/2. - buffer_dist, point_1[1] - start_acquisition])
+        end=np.asarray([point_2[0] + separation/2. + buffer_dist, point_2[3] + start_acquisition])
         start_points.append(start)
         end_points.append(end)
         for run in range(n_runs-1):
@@ -120,10 +120,10 @@ def get_fligh_lines_coordinates(polygon,flight_azimuth, n_runs, separation, buff
 
     else:
         if slope >= 0:
-            ref=get_point_in_distance_line([point_1[0],point_1[1]],normal_slope,-buffer_dist/2.)  
+            ref=get_point_in_distance_line([point_1[0] ,point_1[1]],normal_slope, separation/2. - buffer_dist)  
             point_down,point_up=get_extreme_points(polygon,flight_azimuth-90.)
         else:
-            ref=get_point_in_distance_line([point_1[0],point_1[1]],normal_slope,-buffer_dist/2.)  
+            ref=get_point_in_distance_line([point_1[0],point_1[1]],normal_slope, separation/2. - buffer_dist)  
             point_down,point_up=get_extreme_points(polygon,flight_azimuth+90.)
 
         b_ref=point_slope_formula(ref[0],ref[1],slope)
@@ -287,3 +287,38 @@ def line_intersect(p0, p1, m0=None, m1=None, q0=None, q1=None):
         px = np.array([np.nan, np.nan])
 
     return px
+
+def degrees2ddmmss(decdegrees, is_latitude = True):
+    if is_latitude == True:
+        if np.sign(decdegrees) == -1:
+            zone = 'S'
+        else:
+            zone = 'N'
+    
+    else:    
+        if np.sign(decdegrees) == -1:
+            zone = 'W'
+        else:
+            zone = 'E'
+    
+    decdegrees = np.abs(decdegrees)
+    
+    degrees = int(decdegrees)
+    decminutes = 60. * (decdegrees - degrees)
+    minutes = int(decminutes)
+    seconds = 60 * (decminutes - minutes)
+    
+    return zone, degrees, minutes, seconds
+
+def sensorlink_coordinates(zone, degrees, minutes, seconds, is_latitude = True):
+    if is_latitude:
+        fill = 2
+    else:
+        fill = 3
+        
+    degrees_str = str(int(degrees)).zfill(fill)
+    minutes_dec_str = str(int(1000 * seconds/60.))
+    minutes_str = str(int(minutes)).zfill(2)
+    
+    out_string = '%s.%s.%s,%s'%(degrees_str, minutes_str, minutes_dec_str, zone) 
+    return out_string
