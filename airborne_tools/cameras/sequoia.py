@@ -2,6 +2,34 @@ from pathlib import Path
 import json
 from airborne_tools import exif_tools as et
 
+
+def filename_to_params(in_filename):
+    filename = in_filename.stem
+    pattern = filename.rsplit("_", 1)[0]
+    path = in_filename.parent
+    return path, pattern
+
+
+def get_bands_from_filename(in_filename):
+    path, pattern = filename_to_params(in_filename)
+    bands = path.glob(f"{pattern}_*.TIF")
+    return bands
+
+
+def find_incoherent_filenames(input_dir, ref_band="RED"):
+    imput_dir = Path(input_dir)
+    scenes = imput_dir.glob(f"IMG_*_*_*_{ref_band}.TIF")
+    wrong_scenes = []
+    for scene in scenes:
+        path, pattern = filename_to_params(scene)
+        wrong_scenes.append(pattern)
+        bands = list(get_bands_from_filename(scene))
+        if len(bands) < 4:
+            print(f"Missing band for image {pattern}")
+
+    return wrong_scenes
+
+
 def get_coordinates(image_file):
     exif, xmp = et.get_raw_metadata(str(image_file))
     lat, lon, alt = et.coordinates_from_exif(exif)
