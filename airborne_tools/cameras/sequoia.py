@@ -26,7 +26,7 @@ def create_tracks(input_folder, band="RED", out_geojson=None):
                    "geometry": {"type": "Point",
                                 "coordinates": [lon, lat]},
                    "properties": {"filename": filename,
-                                  "path": scene,
+                                  "path": str(scene),
                                   "latitude": lat,
                                   "longitude": lon,
                                   "altitude": alt,
@@ -35,12 +35,17 @@ def create_tracks(input_folder, band="RED", out_geojson=None):
                                   "yaw": yaw}}
         json_dict["features"].append(feature)
 
+        return json_dict
+
+
     if out_geojson:
+        out = json.dumps(json_dict,
+                         indent=4,
+                         separators=(',', ': '))
+
         with open(out_geojson, "w") as fid:
-            json.dump(fid, json_dict)
+            fid.write(out)
+            fid.flush()
 
     return json_dict
 
-input_folder = Path("/media/hector/TOSHIBA_2TB/vuelo/images")
-out_gejson = input_folder.parent / "track.geojson"
-create_tracks(input_folder, band="RED", out_geojson=out_gejson)
