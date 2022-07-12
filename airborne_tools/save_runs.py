@@ -46,7 +46,7 @@ def get_flight_lines_paramters(altitude,total_swath,camera_size,focal_length,ove
     on_ground_coord=[0,0,0]
     c_xy=np.asarray(camera_size)/2.# Assume Principal Point at the center of the camera
     rotation=np.eye(3)# Assume nadir viewing rotation matrix
-    half_across,half_along=georef.CalcCoordinatesCollinearity(pixel,c_xy,altitude,on_ground_coord,rotation,focal_length)
+    half_across,half_along=georef.coordinates_collinearity(pixel, c_xy, altitude, on_ground_coord, rotation, focal_length)
     
     witdh=2*abs(half_across)
     height=2*abs(half_along)
