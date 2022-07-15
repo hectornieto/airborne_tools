@@ -33,13 +33,13 @@ def find_incoherent_filenames(input_dir, ref_band="RED"):
 def get_coordinates(image_file):
     exif, xmp = et.get_raw_metadata(str(image_file))
     lat, lon, alt = et.coordinates_from_exif(exif)
-    roll = float(xmp["Xmp.Camera.Roll"])
-    pitch = float(xmp["Xmp.Camera.Pitch"])
     yaw = float(xmp["Xmp.Camera.Yaw"])
-    return lat, lon, alt, roll, pitch, yaw
+    pitch = float(xmp["Xmp.Camera.Pitch"])
+    roll = float(xmp["Xmp.Camera.Roll"])
+    return lat, lon, alt, yaw, pitch, roll
 
 
-def create_tracks(input_folder, band="RED", out_geojson=None):
+def create_shots(input_folder, band="RED", out_geojson=None):
     input_folder = Path(input_folder)
     scenes = input_folder.glob(f"*_{band}.TIF")
     json_dict = {"type": "FeatureCollection",
@@ -49,7 +49,7 @@ def create_tracks(input_folder, band="RED", out_geojson=None):
     for scene in scenes:
         filename = scene.name
         print(filename)
-        lat, lon, alt, roll, pitch, yaw = get_coordinates(scene)
+        lat, lon, alt, yaw, pitch, roll = get_coordinates(scene)
         feature = {"type": "Feature",
                    "geometry": {"type": "Point",
                                 "coordinates": [lon, lat]},
@@ -63,9 +63,6 @@ def create_tracks(input_folder, band="RED", out_geojson=None):
                                   "yaw": yaw}}
         json_dict["features"].append(feature)
 
-        return json_dict
-
-
     if out_geojson:
         out = json.dumps(json_dict,
                          indent=4,
@@ -76,4 +73,5 @@ def create_tracks(input_folder, band="RED", out_geojson=None):
             fid.flush()
 
     return json_dict
+
 
