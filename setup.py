@@ -46,7 +46,7 @@ REQS = [
     'gdal',
     'osr',
     'sklearn',
-    'pil']
+    'pillow']
 
 setup(
     name                  = "airborne_tools",
