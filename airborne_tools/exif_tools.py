@@ -46,3 +46,12 @@ def coordinates_from_exif(exif):
 
     return lat, lon, alt
 
+
+def camera_intrinsic(exif):
+    focal_35 = float(exif["Exif.Photo.FocalLengthIn35mmFilm"])
+    cols = float(exif["Exif.Image.ImageWidth"])
+    rows = float(exif["Exif.Image.ImageLength"])
+    orientation = int(exif["Exif.Image.Orientation"])
+    dims = rows, cols
+    focal_length = cols * focal_35 / 36.
+    return dims, focal_length, orientation
