@@ -1,19 +1,46 @@
+from pathlib import Path
 import numpy as np
 import cv2
+from pyproj import CRS, Transformer
+from pyproj.aoi import AreaOfInterest
+from pyproj.database import query_utm_crs_info
+import json
+from airborne_tools import exif_tools as et
+
+WGS84_A = 6378137.0
+WGS84_B = 6356752.314245
+
+def ecef_from_lla(lat, lon, alt):
+    """
+    Compute ECEF XYZ from latitude, longitude and altitude.
+
+    All using the WGS84 model.
+    Altitude is the distance to the WGS84 ellipsoid.
+
+    """
+    a2 = WGS84_A ** 2
+    b2 = WGS84_B ** 2
+    lat = np.radians(lat)
+    lon = np.radians(lon)
+    l = 1.0 / np.sqrt(a2 * np.cos(lat) ** 2 + b2 * np.sin(lat) ** 2)
+    x = (a2 * l + alt) * np.cos(lat) * np.cos(lon)
+    y = (a2 * l + alt) * np.cos(lat) * np.sin(lon)
+    z = (b2 * l + alt) * np.sin(lat)
+    return np.array([x, y, z])
 
 
-def coordinates_collinearity(pixel, c_xy, altitude, origin, rotation_matrix,
+def coordinates_collinearity(pixel, c_rc, altitude, origin, rotation_matrix,
                              focal_length):
     '''Calculates the projected coordinates of an image pixel by applying the 
     collinearity equation
     
     Parameters
     ----------
-    pixel : pixel coordinates (col,row) with the origin at the top left corner
+    pixel : pixel coordinates (row, col) with the origin at the top left corner
         of the image with x axis pointing right and y axis pointing down
-    c_xy: pixel coordinates (col,row) of the principal point
+    c_rc: pixel coordinates (row, col) of the principal point
     altitude: Pixel ground elevation, Z (m)
-    origin: the coordinates (X0,Y0,Z0) of the center of projection of the camera
+    origin: the coordinates (X0, Y0, Z0) of the center of projection of the camera
     rotation_matrix : Rotation matrix (Omega,Phi,Kappa)
     focal_length : Camera focal length (pixels)
 
@@ -22,16 +49,16 @@ def coordinates_collinearity(pixel, c_xy, altitude, origin, rotation_matrix,
     X, Y : pixel coordinates (X Y) at ground elevation (altitude)'''
 
     z_z0 = altitude - float(origin[2])
-    y = c_xy[1] - pixel[1]
-    x = pixel[0] - c_xy[0]
-    denom = (rotation_matrix[2, 0] * x + rotation_matrix[2, 1] * y
+    v = pixel[1] - c_rc[1]
+    u = c_rc[0] - pixel[0]
+    denom = (rotation_matrix[2, 0] * u + rotation_matrix[2, 1] * v
              - rotation_matrix[2, 2] * focal_length)
-    x_x0 = z_z0 * (rotation_matrix[0, 0] * x + rotation_matrix[0, 1] * y
-                   - rotation_matrix[0, 2] * focal_length) / denom
-    y_y0 = z_z0 * (rotation_matrix[1, 0] * x + rotation_matrix[1, 1] * y
-                   - rotation_matrix[1, 2] * focal_length) / denom
-    x = x_x0 + origin[0]
-    y = y_y0 + origin[1]
+    x = origin[0] + z_z0 * (rotation_matrix[0, 0] * u + rotation_matrix[0, 1] * v
+                            - rotation_matrix[0, 2] * focal_length) / denom
+
+    y = origin[1] + z_z0 * (rotation_matrix[1, 0] * u + rotation_matrix[1, 1] * v
+                            - rotation_matrix[1, 2] * focal_length) / denom
+
     return x, y
 
 
@@ -222,14 +249,15 @@ def undistort(img, c_xy, f_xy, K, T=[0, 0], skew=0):
     # dst[int(v[pixel]),int(u[pixel]),:]=img[pixel[0],pixel[1],:]
     return dst
 
-def pixel_collinearity(coordinates, c_xy, origin, rotation_matrix, focal_length):
+
+def pixel_collinearity(coordinates, c_rc, origin, rotation_matrix, focal_length):
     '''Calculates the pixel coordinates for a map projected coordinates by applying the 
     collinearity equation
     
     Parameters
     ----------
     coordinates : map projected coordinates (X,Y,Z) 
-    c_xy: pixel coordinates (row,col) of the principal point
+    c_rc: pixel coordinates (row, col) of the principal point
     origin: the coordinates (X0,Y0,Z0) of the center of projection of the camera
     rotation_matrix : Rotation matrix (Omega,Phi,Kappa)
     focal_length : Camera focal length (pixels)
@@ -242,19 +270,20 @@ def pixel_collinearity(coordinates, c_xy, origin, rotation_matrix, focal_length)
     x_x0 = coordinates[0] - origin[0]
     y_y0 = coordinates[1] - origin[1]
     z_z0 = coordinates[2] - origin[2]
-    denom = (rotation_matrix[0, 2] * x_x0 + rotation_matrix[1, 2] \
+    denom = (rotation_matrix[0, 2] * x_x0 + rotation_matrix[1, 2]
              * y_y0 + rotation_matrix[2, 2] * z_z0)
-    x = -focal_length * (rotation_matrix[0, 0] * x_x0 + rotation_matrix[1, 0] \
+    x = -focal_length * (rotation_matrix[0, 0] * x_x0 + rotation_matrix[1, 0]
                          * y_y0 + rotation_matrix[2, 0] * z_z0) / denom
-    y = -focal_length * (rotation_matrix[0, 1] * x_x0 + rotation_matrix[1, 1] \
+    y = -focal_length * (rotation_matrix[0, 1] * x_x0 + rotation_matrix[1, 1]
                          * y_y0 + rotation_matrix[2, 1] * z_z0) / denom
-    u = x + c_xy[0]
-    v = c_xy[1] - y
-    return u, v
+
+    row = c_rc[0] - y
+    col = x + c_rc[1]
+
+    return row, col
 
 
-
-def get_rpy(rotation):
+def get_ypr(rotation):
     '''Calculate the rotation angles from a rotation matrix (Rz(kappa),Ry(pitch),Rx(roll))
 
     Parameter
@@ -263,12 +292,28 @@ def get_rpy(rotation):
     
     Returns
     -------
-    roll, pitch, yaw : photogrametric angles'''
+    yaw, pitch, roll : photogrametric angles'''
+    yaw = np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    pitch = np.degrees(np.arcsin(-rotation[2, 0]))
+    roll = np.degrees(np.arctan2(rotation[2, 1], rotation[2, 2]))
 
-    alpha_y = np.degrees(np.arcsin(-rotation[2, 0]))
-    alpha_x = np.degrees(np.arctan2(rotation[2, 1], rotation[2, 2]))
-    alpha_z = np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0]))
-    return alpha_x, alpha_y, alpha_z
+    return yaw, pitch, roll
+
+
+def get_opk(rotation):
+    '''Calculate the rotation angles from a rotation matrix (Rz(kappa),Ry(pitch),Rx(roll))
+
+    Parameter
+    --------
+    rotation : 3D rotation matrix
+
+    Returns
+    -------
+    Omega,phi,kappa : photogrametric angles'''
+    omega = np.degrees(np.arctan2(-rotation[1, 2], rotation[2, 2]))
+    phi = np.degrees(np.arcsin(rotation[0, 2]))
+    kappa = np.degrees(np.arctan2(-rotation[0, 1], rotation[0, 0]))
+    return omega, phi, kappa
 
 
 def rot_x(alpha):
@@ -318,7 +363,6 @@ def rot_z(alpha):
     -------
     r_z: rotation matrix over Z'''
 
-    import numpy as np
     alpha = np.radians(alpha)
     r_z = np.array([[np.cos(alpha), -np.sin(alpha), 0],
                     [np.sin(alpha), np.cos(alpha), 0],
@@ -326,21 +370,149 @@ def rot_z(alpha):
     return r_z
 
 
-def get_opk(rotation):
-    '''Calculate the rotation angles from a rotation matrix (Rz(kappa),Ry(pitch),Rx(roll))
+def rotation_ypr(yaw, pitch, roll):
+    r_y = rot_z(yaw)
+    r_p = rot_y(pitch)
+    r_r = rot_x(roll)
+    cnb = np.linalg.multi_dot([r_y, r_p, r_r])
 
-    Parameter
-    --------
-    rotation : 3D rotation matrix
-    
-    Returns
-    -------
-    Omega,phi,kappa : photogrametric angles'''
+    return cnb
 
-    phi = np.degrees(np.arcsin(rotation[0][2]))
-    omega = np.degrees(np.arctan2(-rotation[1][2], rotation[2][2]))
-    kappa = np.degrees(np.arctan2(-rotation[0][1], rotation[0][0]))
+
+def rotation_opk(omega, phi, kappa):
+    r_w = rot_x(omega)
+    r_p = rot_y(phi)
+    r_k = rot_z(kappa)
+    ceb = np.linalg.multi_dot([r_w, r_p, r_k])
+    return ceb
+
+
+def rotation_cen(lat, lon, alt, delta=1e-7):
+
+    p1 = ecef_from_lla(lat + delta, lon, alt)
+    p2 = ecef_from_lla(lat - delta, lon, alt)
+    xnp = p1 - p2
+    m = np.linalg.norm(xnp)
+    # Unit vector pointing north
+    xnp /= m
+    znp = np.array([0, 0, -1])
+    ynp = np.cross(znp, xnp)
+    cen = np.array([xnp, ynp, znp]).T
+    return cen
+
+
+def ypr_2_opk(lat, lon, alt, yaw, pitch, roll, orientation=1):
+    # YPR rotation matrix
+    cnb = rotation_ypr(yaw, pitch, roll)
+    # Convert between image and body coordinates
+    # (Swap X/Y, flip Z)
+    if orientation == 1:
+        cbb = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
+    elif orientation == 3:
+        cbb = np.array([[0, -1, 0], [-1, 0, 0], [0, 0, -1]])
+
+    cen = rotation_cen(lat, lon, alt)
+
+    # OPK rotation matrix
+    ceb = np.linalg.multi_dot([cen, cnb, cbb])
+    omega, phi, kappa = get_opk(ceb)
     return omega, phi, kappa
 
 
+def opk_from_opensfm(exif_json):
+    with open(exif_json, "r") as fid:
+        data = json.load(fid)
+    omega = data["opk"]["omega"]
+    phi = data["opk"]["phi"]
+    kappa = data["opk"]["kappa"]
 
+    return omega, phi, kappa
+
+def create_footprint(lat, lon, alt, yaw, pitch, roll, focal_length, dims, z_ground,
+                     orientation=1):
+    # YPR rotation matrix
+    omega, phi, kappa = ypr_2_opk(lat, lon, alt, yaw, pitch, roll, orientation=orientation)
+    ceb = rotation_opk(omega, phi, kappa)
+    utm_crs = query_utm_crs_info(datum_name="WGS 84",
+                                 area_of_interest=AreaOfInterest(west_lon_degree=lon,
+                                                                 south_lat_degree=lat,
+                                                                 east_lon_degree=lon,
+                                                                 north_lat_degree=lat))
+    utm_crs = CRS.from_epsg(utm_crs[0].code)
+    proj = Transformer.from_crs(utm_crs.geodetic_crs, utm_crs, always_xy=True)
+    x_0, y_0 = proj.transform(lon, lat)
+
+    c_rc = 0.5 * dims[0], 0.5 * dims[1]
+    ul = coordinates_collinearity((0., 0.), c_rc, z_ground, (x_0, y_0, alt), ceb,
+                                  focal_length)
+
+    ur = coordinates_collinearity((0., dims[1]), c_rc, z_ground, (x_0, y_0, alt), ceb,
+                                  focal_length)
+
+    lr = coordinates_collinearity(dims, c_rc, z_ground, (x_0, y_0, alt), ceb,
+                                  focal_length)
+
+    ll = coordinates_collinearity((dims[0], 0.), c_rc, z_ground, (x_0, y_0, alt), ceb,
+                                  focal_length)
+
+    return ul, ur, lr, ll, utm_crs
+
+
+def footprint_2_geojson(ul, ur, lr, ll, crs, out_geojson=None, properties={}):
+    feature = {"type": "Feature",
+               "geometry": {"type": "Polygon",
+                            "coordinates": [[ul, ur, lr, ll]]
+                            },
+               "properties": properties
+               }
+
+    json_dict = {"type": "FeatureCollection",
+                 "crs": {"type": "name",
+                         "properties": {"name": f"EPSG:{crs.to_epsg()}"}},
+                 "features": [feature]}
+
+    if out_geojson:
+        out = json.dumps(json_dict,
+                         indent=4,
+                         separators=(',', ': '))
+        with open(out_geojson, "w") as fid:
+            fid.write(out)
+            fid.flush()
+
+    return json_dict
+
+if __name__ == "__main__":
+
+    from cameras import sequoia
+    flight_height = 15
+    workdir = Path(f"/mnt/lvstorage/UAV/DJI/20220526/{flight_height}m/VNIR")
+
+    in_dir = workdir / "images"
+    footprint_dir = workdir / "footprints"
+    if not footprint_dir.is_dir():
+        footprint_dir.mkdir(parents=True)
+
+
+    sequoia.create_shots(in_dir, band="RED", out_geojson=workdir / "shots_raw.geojson")
+    scenes = sorted(in_dir.glob("*_RED.TIF"))
+    for scene in scenes:
+        filename = scene.name
+        lat, lon, alt, yaw, pitch, roll = sequoia.get_coordinates(scene)
+        # pitch, roll = 0., 0.
+        properties = {"filename": filename,
+                      "path": str(scene),
+                      "latitude": lat,
+                      "longitude": lon,
+                      "altitude": alt,
+                      "roll": roll,
+                      "pitch": pitch,
+                      "yaw": yaw}
+
+        z_ground = alt - flight_height
+        exif, xmp = et.get_raw_metadata(str(scene))
+        dims, focal_length, orientation = et.camera_intrinsic(exif)
+        footprint = create_footprint(lat, lon, alt, yaw, pitch, roll, focal_length, dims,
+                                     z_ground, orientation=orientation)
+        footprint_2_geojson(*footprint, out_geojson=footprint_dir / f"{filename}.geojson",
+                            properties=properties)
+        print(f"Footprint created for file {filename}")
