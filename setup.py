@@ -41,12 +41,15 @@ def read_file(filepath, root=PROJECT_ROOT):
 
 LONG_DESCRIPTION = read_file("README.md")
 SHORT_DESCRIPTION = "Python tools for processing very high resolution imagery onboard an RPAS or an manned aircraft"
-REQS = [
-    'numpy>=1.10',
-    'gdal',
-    'osr',
-    'sklearn',
-    'pillow']
+REQS = ['numpy>=1.10',
+        'gdal',
+        'osr',
+        'pillow',
+        'opencv',
+        'pyexiv2',
+        'scipy',
+        'scikit-learn'
+        ]
 
 setup(
     name                  = "airborne_tools",
@@ -59,7 +62,7 @@ setup(
     maintainer_email      = "hector.nieto.solana@gmail.com",
     description           = SHORT_DESCRIPTION,
     license               = "GPL",
-    url                   = "https://github.com/hectornieto/UAV_tools/",
+    url                   = "https://github.com/hectornieto/airborne_tools/",
     long_description      = LONG_DESCRIPTION,
     classifiers           = [
         "Development Status :: Beta",
