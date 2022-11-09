@@ -9,7 +9,7 @@ from pathlib import Path
 from osgeo import gdal, ogr, osr
 import numpy as np
 import cv2
-import image_preprocessing as img
+from airborne_tools import image_preprocessing as img
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH = 6
@@ -914,61 +914,4 @@ def _write_transformation_vector(slave_coords, master_coords, outshapefile, prj)
     # Destroy the data source to free resources
     data_source.Destroy()
     return
-
-
-if __name__ == "__main__":
-    transform = 0  # Set 0 for thin plate spline transformation,
-                   # not recommended unless homogeneous, high quality and dense enough GCPs are obtained,
-                   # otherwise severe distortions might occur.
-                   # Set a positive value instead for a polynomial transformation of order equal to such value
-
-    match_factor = 0.80  # matching factor between keypoint descriptors,
-                         # set a lower value for more restrictive match search, but fewer potential GCPs
-                         # Set to 0 to get the best matches in two images instead of pair of best matches
-
-    search_window_size = 250  # GCPs search and some filtering is done at smaller windows, to ensure distribution
-                              # of GCPs and comply with the assumption of several GCPs filters
-
-    dist_threshold = 10  # Expected maximum translation/error, in georreference units, of the mosaic
-    warp_threshold = 0.025  # Maximum error accepted, in georeference units, when fitting the warp polynomial
-                            # Usually the objective is to have an errof of half-pixel,
-                            # so use one half of the slave pixel resolution
-
-    tir_image = Path("/home/hector/codes/airborne_tools/test/TIR/Tb_TIR_odm_orthophoto.tif")
-    vnir_image = Path("/home/hector/codes/airborne_tools/test/VNIR/Sequoia_VNIR_odm_orthophoto.tif")
-    master_image = Path("/home/hector/codes/airborne_tools/test/VNIR_PCA_odm_orthophoto.tif")
-    collocated_image = Path("/home/hector/codes/airborne_tools/test/TIR_collocated.tif")
-    # optional, inclue a list of GCPs that were selected manually, otherwise set to None
-    manual_gcp_file = Path("/home/hector/codes/airborne_tools/test/GCPs/manual_GCPs.txt")
-    manual_gcp_file = None
-
-    if not master_image.exists():
-        pass
-        # We need to reduce the dimensionality of the master image to a single grayscale band.
-        # We therefore apply a PCA reduction to get a grayscale image combining all spectral bands
-        img.pca(vnir_image,
-                no_data=4294967296,
-                use_bands=[0, 1, 2, 3],
-                pca_components=1,
-                outfile=master_image,
-                normalize=True)
-
-    collocate_image(master_image,
-                    tir_image,
-                    collocated_image,
-                    slave_bands=[0],
-                    master_no_data=np.nan,
-                    slave_no_data=65535,
-                    dist_threshold=dist_threshold,
-                    pixel_threshold=5,
-                    angle_threshold=45,
-                    warp_threshold=warp_threshold,
-                    filter_intersect=True,
-                    search_window_size=search_window_size,
-                    manual_gcp_file=manual_gcp_file,
-                    transform=transform,
-                    use_sift=True,
-                    match_factor=match_factor,
-                    image_to_georeference=None,
-                    bands_to_georeference=[0])
 
