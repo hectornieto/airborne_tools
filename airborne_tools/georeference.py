@@ -1,11 +1,9 @@
-from pathlib import Path
 import numpy as np
 import cv2
 from pyproj import CRS, Transformer
 from pyproj.aoi import AreaOfInterest
 from pyproj.database import query_utm_crs_info
 import json
-from airborne_tools import exif_tools as et
 
 WGS84_A = 6378137.0
 WGS84_B = 6356752.314245
@@ -481,38 +479,3 @@ def footprint_2_geojson(ul, ur, lr, ll, crs, out_geojson=None, properties={}):
 
     return json_dict
 
-if __name__ == "__main__":
-
-    from cameras import sequoia
-    flight_height = 15
-    workdir = Path(f"/mnt/lvstorage/UAV/DJI/20220526/{flight_height}m/VNIR")
-
-    in_dir = workdir / "images"
-    footprint_dir = workdir / "footprints"
-    if not footprint_dir.is_dir():
-        footprint_dir.mkdir(parents=True)
-
-
-    sequoia.create_shots(in_dir, band="RED", out_geojson=workdir / "shots_raw.geojson")
-    scenes = sorted(in_dir.glob("*_RED.TIF"))
-    for scene in scenes:
-        filename = scene.name
-        lat, lon, alt, yaw, pitch, roll = sequoia.get_coordinates(scene)
-        # pitch, roll = 0., 0.
-        properties = {"filename": filename,
-                      "path": str(scene),
-                      "latitude": lat,
-                      "longitude": lon,
-                      "altitude": alt,
-                      "roll": roll,
-                      "pitch": pitch,
-                      "yaw": yaw}
-
-        z_ground = alt - flight_height
-        exif, xmp = et.get_raw_metadata(str(scene))
-        dims, focal_length, orientation = et.camera_intrinsic(exif)
-        footprint = create_footprint(lat, lon, alt, yaw, pitch, roll, focal_length, dims,
-                                     z_ground, orientation=orientation)
-        footprint_2_geojson(*footprint, out_geojson=footprint_dir / f"{filename}.geojson",
-                            properties=properties)
-        print(f"Footprint created for file {filename}")
