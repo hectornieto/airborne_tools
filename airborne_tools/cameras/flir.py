@@ -26,7 +26,7 @@
 '''
 import struct
 import numpy as np
-import gdal
+from osgeo import gdal
 
 TOTAL_HEADER=892 
 IMAGE_HEADER=120
