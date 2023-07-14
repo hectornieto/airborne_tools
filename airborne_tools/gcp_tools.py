@@ -14,7 +14,7 @@ from scipy import stats
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH = 6
-
+P_VALUE_THRESHOLD = 0.05
 def collocate_image(master_file,
                     slave_file,
                     output_file,
@@ -221,13 +221,15 @@ def collocate_image(master_file,
                 mask_blocks = ~np.logical_or(np.isnan(slave_blocks), np.isnan(master_blocks))
 
                 # calculate spearman's correlation to check if correlation is positive or negative
-                r_spearman = stats.spearmanr(slave_blocks[mask_blocks], master_blocks[mask_blocks])[0]
-                print(f'r_cor = {r_spearman}, N = {slave_blocks[mask_blocks].size}')
+                r_spearman, p_value = stats.spearmanr(slave_blocks[mask_blocks], master_blocks[mask_blocks])
+                print(f'r_cor = {r_spearman:.2f}, p-val = {p_value:.2f} '
+                      f'N = {slave_blocks[mask_blocks].size}')
 
                 # inverse the values if expected relationship is negatively related
                 # (low value features become high value features)
-                if r_spearman < 0:
-                    print('Negative relation found between master and slave')
+                if r_spearman < 0 and p_value < P_VALUE_THRESHOLD:
+                    print(f'Significant (p < {P_VALUE_THRESHOLD}) '
+                          f'negative relation found between master and slave')
                     slave_scaled *= -1
 
                 if np.all(slave_scaled == slave_no_data):  # If all pixels have no data skip tile
