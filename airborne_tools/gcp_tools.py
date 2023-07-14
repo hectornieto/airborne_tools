@@ -10,10 +10,10 @@ from osgeo import gdal, ogr, osr
 import numpy as np
 import cv2
 from airborne_tools import image_preprocessing as img
+from scipy import stats
 
 FLANN_INDEX_KDTREE = 1
 FLANN_INDEX_LSH = 6
-
 
 def collocate_image(master_file,
                     slave_file,
@@ -191,6 +191,11 @@ def collocate_image(master_file,
                 continue
 
             master_scaled = img.scale_grayscale_image(master_scaled, no_data=master_no_data)
+
+            # separate into 10 x 10 blocks and get mean values for each block
+            # to be used to check correlation with slave blocks (positive or negative relation)
+            master_blocks = split_blocks(master_scaled, 10)
+
             if np.all(master_scaled == 0):
                 continue
 
@@ -203,10 +208,28 @@ def collocate_image(master_file,
             for band in slave_bands:
                 slave_scaled = slavefid.GetRasterBand(band + 1).ReadAsArray(upper_col, upper_row,
                                                                             win_xsize, win_ysize).astype(float)
+                # check if relation is direct or inverted
+                # separate into 10 x 10 blocks and get mean values for each block
+                slave_blocks = split_blocks(slave_scaled, 10)
+                # mask to eliminate blocks with nodata
+                mask_blocks = ~np.logical_or(np.isnan(slave_blocks), np.isnan(master_blocks))
+
+                # calculate spearman's correlation to check if correlation is positive or negative
+                r_spearman = stats.spearmanr(slave_blocks[mask_blocks], master_blocks[mask_blocks])[0]
+                print(f'r_cor = {r_spearman}, N = {slave_blocks[mask_blocks].size}')
+
+                # inverse the values if expected relationship is negatively related
+                # (low value features become high value features)
+                if r_spearman < 0:
+                    print('Negative relation found between master and slave')
+                    slave_scaled *= -1
+
                 if np.all(slave_scaled == slave_no_data):  # If all pixels have no data skip tile
                     continue
 
                 slave_scaled = img.scale_grayscale_image(slave_scaled, no_data=slave_no_data)
+
+
                 if np.all(slave_scaled == 0):
                     continue
 
@@ -266,8 +289,6 @@ def collocate_image(master_file,
         n_gcps["warp"] = len(gcp_valid)
 
 
-    print(n_gcps)
-
     # Add manual GCPs
     if manual_gcp_file:
         print(f"Adding manual GCPs")
@@ -297,11 +318,11 @@ def collocate_image(master_file,
     warp_image_with_gcps(slave_file,
                          gcp_valid,
                          output_file,
-                         output_extent=output_extent,
+                         output_extent=None,
                          src_no_data=slave_no_data,
                          transform=transform,
+                         data_type=gdal.GDT_Float32,
                          subset_bands=bands_to_georeference)
-
 
 def warp_image_with_gcps(input_file,
                          gcp_list,
@@ -584,28 +605,29 @@ def filter_gcp_by_intersection(gcps, slave_gt):
     if len(gcps.shape) == 1:
         gcps = gcps.reshape(1, -1)
 
-    x_slave, y_slave = img.get_map_coordinates(gcps[:, 2], gcps[:, 3], slave_gt)
-    obs_vec = (gcps[:, 0] - x_slave, gcps[:, 1] - y_slave)
-    azimuth = calc_azimuth(obs_vec)
-    cos_azimuth = np.cos(np.radians(azimuth))
-    sin_azimuth = np.sin(np.radians(azimuth))
-    mean_azimuth = np.degrees(np.arctan2(np.mean(sin_azimuth), np.mean(cos_azimuth)))
-    diff = np.abs(calc_azimuth_difference(azimuth, mean_azimuth))
-    indices = diff.argsort()[::-1]
-    for i, index in enumerate(indices):
-        good = True
-        if i == len(indices) - 2:
-            continue
-        for j in range(i + 1, len(indices)):
-            intercept = _calc_vector_intersection((x_slave[index], y_slave[index]),
-                                                  (gcps[index, 0], gcps[index, 1]),
-                                                  (x_slave[indices[j]], y_slave[indices[j]]),
-                                                  (gcps[indices[j], 0], gcps[indices[j], 1]))
-            if intercept:  # GCPs closer to each other are discarded to avoid overfitting
-                good = False
-                break
-        if good:
-            gcps_good.append(gcps[index])
+    else:
+        x_slave, y_slave = img.get_map_coordinates(gcps[:, 2], gcps[:, 3], slave_gt)
+        obs_vec = (gcps[:, 0] - x_slave, gcps[:, 1] - y_slave)
+        azimuth = calc_azimuth(obs_vec)
+        cos_azimuth = np.cos(np.radians(azimuth))
+        sin_azimuth = np.sin(np.radians(azimuth))
+        mean_azimuth = np.degrees(np.arctan2(np.mean(sin_azimuth), np.mean(cos_azimuth)))
+        diff = np.abs(calc_azimuth_difference(azimuth, mean_azimuth))
+        indices = diff.argsort()[::-1]
+        for i, index in enumerate(indices):
+            good = True
+            if i == len(indices) - 2:
+                continue
+            for j in range(i + 1, len(indices)):
+                intercept = _calc_vector_intersection((x_slave[index], y_slave[index]),
+                                                      (gcps[index, 0], gcps[index, 1]),
+                                                      (x_slave[indices[j]], y_slave[indices[j]]),
+                                                      (gcps[indices[j], 0], gcps[indices[j], 1]))
+                if intercept:  # GCPs closer to each other are discarded to avoid overfitting
+                    good = False
+                    break
+            if good:
+                gcps_good.append(gcps[index])
 
     return gcps_good
 
@@ -915,3 +937,34 @@ def _write_transformation_vector(slave_coords, master_coords, outshapefile, prj)
     data_source.Destroy()
     return
 
+def split_blocks(array, nblocks):
+    """
+    split 2D array into equal blocks in both vertical and horizontal direction
+    and calculates mean for each block
+
+    Parameters
+    ----------
+    input array: 2D numpy array
+
+    nblocks: int
+        number of blocks to divide array
+
+    Returns
+    -------
+    block_means: numpy array
+        array with mean values for each block
+
+    """
+    # function to split array into equal blocks in both vertical and horizontal direction
+    # and calculate mean for each block
+    block_means = []
+    # split array into equal blocks in axis 0 (i.e. in rows horizontally)
+    ar_split1 = np.array_split(array, nblocks)
+    for ar in ar_split1:
+        # further split array into equal blocks in axis 1 (i.e. in cols vertically)
+        ar_split2 = np.array_split(ar, nblocks, axis=1)
+        for ar_sub in ar_split2:
+            ar_mean = np.nanmean(ar_sub)
+            block_means.append(ar_mean)
+
+    return np.array(block_means)

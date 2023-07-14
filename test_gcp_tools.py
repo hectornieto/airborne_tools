@@ -19,13 +19,16 @@ dist_threshold = 10  # Expected maximum translation/error, in georreference unit
 warp_threshold = 0.025  # Maximum error accepted, in georeference units, when fitting the warp polynomial
 # Usually the objective is to have an errof of half-pixel,
 # so use one half of the slave pixel resolution
+# current work directory
+workdir = Path()
+test_dir = workdir / 'test'
 
-tir_image = Path("/home/hector/codes/airborne_tools/test/TIR/Tb_TIR_odm_orthophoto.tif")
-vnir_image = Path("/home/hector/codes/airborne_tools/test/VNIR/Sequoia_VNIR_odm_orthophoto.tif")
-master_image = Path("/home/hector/codes/airborne_tools/test/Sequoia_PCA_odm_orthophoto.tif")
-collocated_image = Path("/home/hector/codes/airborne_tools/test/TIR_collocated.tif")
+tir_image = test_dir / 'tir_odm_20220916.tif'
+vnir_image = test_dir / 'Sequoia_vnir_20220916.tif'
+master_image = test_dir / 'Sequoia_vnir_20220916_PC1.tif'
+collocated_image = test_dir / 'tir_odm_20220916_collocated.tif'
+
 # optional, inclue a list of GCPs that were selected manually, otherwise set to None
-manual_gcp_file = Path("/home/hector/codes/airborne_tools/test/GCPs/manual_GCPs.txt")
 manual_gcp_file = None
 
 if not master_image.exists():

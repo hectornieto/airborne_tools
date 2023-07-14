@@ -65,6 +65,35 @@ def pca(image_file,
 
 
 def scale_grayscale_image(image, no_data=None, stretch=MIN_MAX_STRETCH):
+    index = np.logical_and(image != no_data, np.isfinite(image))
+
+    if isinstance(no_data, type(None)):
+        index = np.logical_and(image != no_data, np.isfinite(image))
+    else:
+        index = np.ones(image.shape, dtype=bool)
+
+
+    if stretch == 0:
+        min_val = np.nanmin(image[index])
+        max_val = np.nanmax(image[index])
+    elif stretch > 0:
+        min_val = np.nanpercentile(image[index], stretch)
+        max_val = np.nanpercentile(image[index], 1 - stretch)
+    else:
+        mean = np.nanmean(image[index])
+        std = np.nanstd(image[index])
+        min_val = mean + stretch * std
+        max_val = mean - stretch * std
+
+    image[~index] = 0
+    if np.sum(index) > 30:
+        image[index] = (2**8 - 1) * ((image[index] - min_val) / (max_val - min_val))
+        image = cv2.equalizeHist(image.astype(np.uint8))
+    else:
+        image *= 0
+    return image
+
+def scale_normalize_image(image, no_data=None, stretch=MIN_MAX_STRETCH):
     if isinstance(no_data, type(None)):
         index = np.logical_and(image != no_data, np.isfinite(image))
     else:
@@ -89,7 +118,6 @@ def scale_grayscale_image(image, no_data=None, stretch=MIN_MAX_STRETCH):
     else:
         image *= 0
     return image
-
 
 def get_map_coordinates(row, col, gt):
     x = gt[0] + gt[1] * col + gt[2] * row
