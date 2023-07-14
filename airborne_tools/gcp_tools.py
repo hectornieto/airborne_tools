@@ -969,8 +969,6 @@ def split_blocks(array, nblocks):
     for ar in ar_split1:
         # further split array into equal blocks in axis 1 (i.e. in cols vertically)
         ar_split2 = np.array_split(ar, nblocks, axis=1)
-        for ar_sub in ar_split2:
-            ar_mean = np.nanmean(ar_sub)
-            block_means.append(ar_mean)
+        block_means += [np.nanmean(ar) for ar in ar_split2]
 
     return np.array(block_means)
