@@ -190,11 +190,14 @@ def collocate_image(master_file,
             if np.all(master_scaled == master_no_data):  # If all pixels have no data skip tile
                 continue
 
-            master_scaled = img.scale_grayscale_image(master_scaled, no_data=master_no_data)
-
             # separate into 10 x 10 blocks and get mean values for each block
             # to be used to check correlation with slave blocks (positive or negative relation)
-            master_blocks = split_blocks(master_scaled, 10)
+            master_blocks = split_blocks(np.where(master_scaled == master_no_data,
+                                                  np.nan,
+                                                  master_scaled),
+                                         10)
+
+            master_scaled = img.scale_grayscale_image(master_scaled, no_data=master_no_data)
 
             if np.all(master_scaled == 0):
                 continue
@@ -210,7 +213,10 @@ def collocate_image(master_file,
                                                                             win_xsize, win_ysize).astype(float)
                 # check if relation is direct or inverted
                 # separate into 10 x 10 blocks and get mean values for each block
-                slave_blocks = split_blocks(slave_scaled, 10)
+                slave_blocks = split_blocks(np.where(slave_scaled == slave_no_data,
+                                                     np.nan,
+                                                     slave_scaled),
+                                            10)
                 # mask to eliminate blocks with nodata
                 mask_blocks = ~np.logical_or(np.isnan(slave_blocks), np.isnan(master_blocks))
 
