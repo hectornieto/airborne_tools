@@ -88,6 +88,8 @@ def collocate_image(master_file,
         Ratio test filter, as explained by [Lowe2004]_. Set a lower value for more restrictive match search,
         but fewer potential GCPs
         If match_factor=0 only best matches will be selected [CV2docs]_.
+        If match_factor > 1, the algorithm will iterate until the number
+        of valid matches is at least match_factor
     image_to_georeference : str or Path object
         Path to the image that will be collocated.
         If None [Default] the `slave_image` will be collocated
@@ -458,6 +460,8 @@ def find_gcps(master_image,
         Ratio test filter, as explained by [Lowe2004]_. Set a lower value for more restrictive match search,
         but fewer potential GCPs
         If match_factor=0 only best matches will be selected [CV2docs]_.
+        If match_factor > 1, the algorithm will iterate until the number
+        of valid matches is at least match_factor
     use_sift : bool
         Flag whether to use SIFT detector and descriptor [Lowe2004]_.
         If use_sift=False it will use ORB detector and descriptor [Rublee2011]_.
@@ -496,7 +500,35 @@ def find_gcps(master_image,
         return gcp_list
 
     # We use Brute Force algorithm to find matches
-    if match_factor > 0:
+    if match_factor > 1:
+        print(f"Interating the FLANN match factur until "
+              f"potential GCPS >= {match_factor}")
+
+        for factor in np.linspace(0, 1, 100):
+            matcher = cv2.BFMatcher(norm_type)
+            # Get the 2 best matches per feature
+            matches = matcher.knnMatch(des_master, des_slave, k=2)
+            gcp_list = []
+            for i, (m, n) in enumerate(matches):
+
+                if m.distance < factor * n.distance:
+                    master_pt = np.float32(kp_master[m.queryIdx].pt)
+                    x_master, y_master = img.get_map_coordinates(float(master_pt[1]),
+                                                                 float(master_pt[0]),
+                                                                 master_gt)
+
+                    slave_pt = np.float32(kp_slave[m.trainIdx].pt)
+                    gcp_list.append((x_master,
+                                     y_master,
+                                     ul_offset[0] + float(slave_pt[1]),
+                                     ul_offset[1] + float(slave_pt[0])))
+
+            n_gcps = len(gcp_list)
+            print(f"Found {n_gcps} potential GCPs for a distance factor of {factor}")
+            if n_gcps > match_factor:
+                return gcp_list
+
+    elif match_factor > 0:
         cross_check = False
         matcher = cv2.BFMatcher(norm_type)
         # Get the 2 best matches per feature
