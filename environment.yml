@@ -1,0 +1,17 @@
+channels:
+  - conda-forge
+  - default
+
+dependencies:
+  - numpy>=1.10
+  - gdal
+  - pillow
+  - opencv
+  - pyproj
+  - exiv2
+  - scipy
+  - scikit-learn
+  - pip
+  - pip:
+    - pyexiv2
+

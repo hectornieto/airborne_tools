@@ -4,676 +4,938 @@ Created on Mon Sep  5 10:13:51 2016
 
 @author: hector
 """
-from __future__ import print_function
-import gdal
+import os
+from pathlib import Path
+from osgeo import gdal, ogr, osr
 import numpy as np
 import cv2
-from os.path import  basename,dirname,join,exists
-import os
+from airborne_tools import image_preprocessing as img
+from scipy import stats
 
-def collocate_image(master_file, slave_file, output_file, slave_bands=None, noData=0,
-                    dist_threshold=50, pixel_threshold=20, angle_threshold=90, 
-                    std_translation_thres=2, filter_intersect=True,
-                    search_window_size=1000, manual_GCP_file=None, transform=0,
-                    useSIFT=True, match_factor=0.75,image_to_georreference=None, bands_to_georreference=None):
-    outdir=dirname(output_file)
+FLANN_INDEX_KDTREE = 1
+FLANN_INDEX_LSH = 6
+P_VALUE_THRESHOLD = 0.05
+def collocate_image(master_file,
+                    slave_file,
+                    output_file,
+                    slave_bands=None,
+                    master_no_data=0,
+                    slave_no_data=0,
+                    dist_threshold=50,
+                    pixel_threshold=20,
+                    angle_threshold=90,
+                    filter_intersect=True,
+                    warp_threshold=0,
+                    search_window_size=1000,
+                    manual_gcp_file=None,
+                    transform=0,
+                    use_sift=True,
+                    match_factor=0.75,
+                    image_to_georeference=None,
+                    bands_to_georeference=None):
+    """
+    Warps an image following a list of Ground Control Points.
+
+    Parameters
+    ----------
+    master_file : str or Path object
+        Path to the input GDAL compatible image that will be
+        used as reference/master
+    slave_file : str or Path object
+        Path to the input GDAL compatible image that will be used
+        for collocation with respect to the reference/master.
+    output_file : str or Path object
+        Path to the output collocated image.
+    slave_bands : list, optional
+        List of bands of `slave_file` that will be used for feature matching.
+        If None all bands of `slave_file` will be used.
+    master_no_data : float, optional
+        NoData value for the master image.
+    src_no_data : float, optional
+        NoData value for the slave image.
+    dist_threshold : float, optional
+        Maximum translation distance, in destination georrefence units, allowed for each GCP.
+        If zero this test will be omitted.
+    pixel_threshold : float, optional
+        Minimum distance in pixel units allowed between two GCPs
+        If zero this test will be omitted.
+    angle_threshold : float, optional
+        Maximum angular difference (degrees) allowed from the average transformation direction.
+        If zero this test will be omitted.
+    filter_intersect : bool, optional
+        Filter GCPs based on whether they intersect with other GCPs
+        If False this test will be omitted.
+    warp_threshold : float, optional
+        Maximum error accepted, in georeference units, when fitting a 3-degree warp polynomial.
+        Usually the objective is to have an error of half-pixel,
+        so it is recommended to use one half of the slave pixel resolution
+        If zero this test will be omitted.
+    search_window_size : int, optional
+        Feature matching will be performed in tiled-windows, within the slave image, of this size in pixels.
+    manual_gcp_file : str or Path object
+        Path to an ASCII table containing already (manually) assigned GCPs.
+        The ASCII file must contain at least four named columns with headers ["Row, "Col", "X", "Y"].
+    transform : int, default
+        Transformation method to use.
+        If `transform=0` a Thin Plate Spline transformation will be used.
+        Use with caution unless homogeneous, high quality and dense enough GCPs are obtained,
+        otherwise severe distortions might occur.
+        Set a positive value instead for a polynomial transformation of order equal to such value.
+    use_sift : bool
+        Flag whether to use SIFT detector and descriptor [Lowe2004]_.
+        If use_sift=False it will use ORB detector and descriptor [Rublee2011]_.
+    match_factor : float
+        Ratio test filter, as explained by [Lowe2004]_. Set a lower value for more restrictive match search,
+        but fewer potential GCPs
+        If match_factor=0 only best matches will be selected [CV2docs]_.
+    image_to_georeference : str or Path object
+        Path to the image that will be collocated.
+        If None [Default] the `slave_image` will be collocated
+    bands_to_georeference : list
+        List of bands from the image to collocate that will be saved as georreferenced.
+        If None all bands from `image_to_georeference` or `slave_image` will be used.
+
+    Returns
+    -------
+    None
+    """
+
+
+    output_file = Path(output_file)
+    outdir = output_file.parent
     # Read the master TIR mosaic
-    masterfid=gdal.Open(master_file,gdal.GA_ReadOnly)
-    master_geo=masterfid.GetGeoTransform()
-    masterXsize=masterfid.RasterXSize
-    masterYsize=masterfid.RasterYSize
-    
+    masterfid = gdal.Open(str(master_file), gdal.GA_ReadOnly)
+    master_geo = masterfid.GetGeoTransform()
+    master_xsize = masterfid.RasterXSize
+    master_ysize = masterfid.RasterYSize
+
     # Set the extent for the output image equal as the master image
-    xmin,ymax=get_map_coordinates(0,0,master_geo)
-    xmax,ymin=get_map_coordinates(masterYsize,masterXsize,master_geo)
-    output_extent=(xmin,ymin,xmax,ymax)
-    
-    slavefid=gdal.Open(slave_file,gdal.GA_ReadOnly)
-    slaveCols=slavefid.RasterXSize
-    slaveRows=slavefid.RasterYSize
-    slave_geo=slavefid.GetGeoTransform()
-    slave_prj=slavefid.GetProjection()
-    if slave_bands==None:
-        slave_bands= range(slavefid.RasterCount)
+    xmin, ymax = img.get_map_coordinates(0, 0, master_geo)
+    xmax, ymin = img.get_map_coordinates(master_xsize, master_ysize, master_geo)
+    output_extent = (xmin, ymin, xmax, ymax)
+
+    slavefid = gdal.Open(str(slave_file), gdal.GA_ReadOnly)
+    slave_cols = slavefid.RasterXSize
+    slave_rows = slavefid.RasterYSize
+    slave_geo = slavefid.GetGeoTransform()
+    slave_prj = slavefid.GetProjection()
+    if not slave_bands:
+        slave_bands = range(slavefid.RasterCount)
+
     # Get the upper and lower bounds for each tile in the input image
-    upperRows=range(0,slaveRows,search_window_size)
-    upperCols=range(0,slaveCols,search_window_size)
-    nXwindows=len(upperCols)
-    nYwindows=len(upperRows)
+    upper_rows = range(0, slave_rows, search_window_size)
+    upper_cols = range(0, slave_cols, search_window_size)
+    n_xwindows = len(upper_cols)
+    n_ywindows = len(upper_rows)
     # Create the empty list with valid GCPs and count for valid GCPs
-    GCP_valid=[]
-    total=0
-    distance=0
-    azimuth=0
-    intersect=0
-    proximity=0
+    gcp_valid = []
+    total = 0
+    distance = 0
+    azimuth = 0
+    intersect = 0
+    proximity = 0
     # Loop all the tiles to get the GCPs
-    for i,upperRow in enumerate(upperRows):
-        #print('Searching tiles in row %s,'%(upperRow))
-        if i>=nYwindows-1:
-            lowerRow=slaveRows
-            win_ysize=lowerRow-upperRow
+    for i, upper_row in enumerate(upper_rows):
+        # print('Searching tiles in row %s,'%(upperRow))
+        if i >= n_ywindows - 1:
+            lower_row = slave_rows
+            win_ysize = lower_row - upper_row
             # Last tile must fit the image size
         else:
-            lowerRow=upperRows[i+1]
-            win_ysize=search_window_size
-        for j,upperCol in enumerate(upperCols):
-            print('Searching tile row %s, col %s'%(upperRow,upperCol))
-            if j>=nXwindows-1:
-                lowerCol=slaveCols # Last tile must fit the image size
-                win_xsize=lowerCol-upperCol
+            lower_row = upper_rows[i + 1]
+            win_ysize = search_window_size
+
+        for j, upper_col in enumerate(upper_cols):
+            print('Searching tile row %s, col %s' % (upper_row, upper_col))
+            if j >= n_xwindows - 1:
+                lowerCol = slave_cols  # Last tile must fit the image size
+                win_xsize = lowerCol - upper_col
             else:
-                lowerCol=upperCols[j+1]
-                win_xsize=search_window_size
-            xmin,ymax=get_map_coordinates(upperRow,upperCol,slave_geo)
-            xmax,ymin=get_map_coordinates(lowerRow,lowerCol,slave_geo)
+                lowerCol = upper_cols[j + 1]
+                win_xsize = search_window_size
+
+            xmin, ymax = img.get_map_coordinates(upper_row, upper_col, slave_geo)
+            xmax, ymin = img.get_map_coordinates(lower_row, lowerCol, slave_geo)
             # Get the pixel coordinates of the master image
-            xmin-=dist_threshold # THe search window has a buffer equal to the distance threshold
-            ymin-=dist_threshold # THe search window has a buffer equal to the distance threshold
-            xmax+=dist_threshold # THe search window has a buffer equal to the distance threshold
-            ymax+=dist_threshold # THe search window has a buffer equal to the distance threshold
-            upperMasterRow,upperMasterCol=np.floor(get_pixel_coordinates(xmin,ymax,master_geo)).astype(np.int16)
-            lowerMasterRow,lowerMasterCol=np.ceil(get_pixel_coordinates(xmax,ymin,master_geo)).astype(np.int16)
-            upperMasterRow=int(np.clip(upperMasterRow,0,masterYsize))# Avoid negative pixel coordinates
-            upperMasterCol=int(np.clip(upperMasterCol,0,masterXsize))# Avoid negative pixel coordinates
-            lowerMasterRow=int(np.clip(lowerMasterRow,0,masterYsize))# Avoid pixel coordinates beyond the image extent
-            lowerMasterCol=int(np.clip(lowerMasterCol,0,masterXsize))# Avoid pixel coordinates beyond the image extent
-            win_MasterXsize=int(lowerMasterCol-upperMasterCol)
-            win_MasterYsize=int(lowerMasterRow-upperMasterRow)
+            # The search window has a buffer equal to the distance threshold
+            xmin -= dist_threshold
+            ymin -= dist_threshold
+            xmax += dist_threshold
+            ymax += dist_threshold
+
+            ul_master_row, ul_master_col = np.floor(img.get_pixel_coordinates(xmin,
+                                                                              ymax,
+                                                                              master_geo)
+                                                    ).astype(np.int16)
+
+            lr_master_row, lr_master_col = np.ceil(img.get_pixel_coordinates(xmax,
+                                                                             ymin,
+                                                                             master_geo)
+                                                   ).astype(np.int16)
+
+            # Avoid negative pixel coordinates and beyond the image extent
+            ul_master_row = int(np.clip(ul_master_row, 0, master_ysize))
+            ul_master_col = int(np.clip(ul_master_col, 0, master_xsize))
+            lr_master_row = int(np.clip(lr_master_row, 0, master_ysize))
+            lr_master_col = int(np.clip(lr_master_col, 0, master_xsize))
+
+            win_master_xsize = int(lr_master_col - ul_master_col)
+            win_master_ysize = int(lr_master_row - ul_master_row)
             # Read the master image array and subset
-            master_scaled=masterfid.GetRasterBand(1).ReadAsArray(
-                        upperMasterCol,upperMasterRow, win_MasterXsize, 
-                        win_MasterYsize).astype(np.float)
-            master_scaled=scale_grayscale_image(master_scaled, noData=noData)
-            UL_X,UL_Y=get_map_coordinates(upperMasterRow,upperMasterCol,master_geo)
-            # Get the master subset geotransform
-            master_window_geo=(UL_X,master_geo[1],master_geo[2],UL_Y,master_geo[4],master_geo[5])
-            if master_scaled.any() == noData: # If all pixels have no data skip tile
+            master_scaled = masterfid.GetRasterBand(1).ReadAsArray(ul_master_col,
+                                                                   ul_master_row,
+                                                                   win_master_xsize,
+                                                                   win_master_ysize).astype(float)
+
+            if np.all(master_scaled == master_no_data):  # If all pixels have no data skip tile
                 continue
+
+            # separate into 10 x 10 blocks and get mean values for each block
+            # to be used to check correlation with slave blocks (positive or negative relation)
+            master_blocks = split_blocks(np.where(master_scaled == master_no_data,
+                                                  np.nan,
+                                                  master_scaled),
+                                         10)
+
+            master_scaled = img.scale_grayscale_image(master_scaled, no_data=master_no_data)
+
+            if np.all(master_scaled == 0):
+                continue
+
+            ul_x, ul_y = img.get_map_coordinates(ul_master_row, ul_master_col, master_geo)
+            # Get the master subset geotransform
+            master_window_geo = (ul_x, master_geo[1], master_geo[2], ul_y, master_geo[4], master_geo[5])
+
             # Loop all the Principal Componets
-            GCP_region=[]
+            gcp_region = []
             for band in slave_bands:
-                slave_scaled=slavefid.GetRasterBand(band+1).ReadAsArray(
-                                                    upperCol,upperRow, 
-                                                    win_xsize, win_ysize).astype(np.float)
-                if slave_scaled.any() == noData: # If all pixels have no data skip tile
+                slave_scaled = slavefid.GetRasterBand(band + 1).ReadAsArray(upper_col, upper_row,
+                                                                            win_xsize, win_ysize).astype(float)
+                # check if relation is direct or inverted
+                # separate into 10 x 10 blocks and get mean values for each block
+                slave_blocks = split_blocks(np.where(slave_scaled == slave_no_data,
+                                                     np.nan,
+                                                     slave_scaled),
+                                            10)
+                # mask to eliminate blocks with nodata
+                mask_blocks = ~np.logical_or(np.isnan(slave_blocks), np.isnan(master_blocks))
+
+                # calculate spearman's correlation to check if correlation is positive or negative
+                r_spearman, p_value = stats.spearmanr(slave_blocks[mask_blocks], master_blocks[mask_blocks])
+                print(f'r_cor = {r_spearman:.2f}, p-val = {p_value:.2f} '
+                      f'N = {slave_blocks[mask_blocks].size}')
+
+                # inverse the values if expected relationship is negatively related
+                # (low value features become high value features)
+                if r_spearman < 0 and p_value < P_VALUE_THRESHOLD:
+                    print(f'Significant (p < {P_VALUE_THRESHOLD}) '
+                          f'negative relation found between master and slave')
+                    slave_scaled *= -1
+
+                if np.all(slave_scaled == slave_no_data):  # If all pixels have no data skip tile
                     continue
-                slave_scaled=scale_grayscale_image(slave_scaled, noData=noData)
-                if np.any(slave_scaled)==0:
+
+                slave_scaled = img.scale_grayscale_image(slave_scaled, no_data=slave_no_data)
+
+
+                if np.all(slave_scaled == 0):
                     continue
+
                 # Find features and matches
-                GCPs=find_GCPs(master_scaled,slave_scaled,master_window_geo,
-                                   UL_offset=(upperRow,upperCol),
-                                    match_factor=match_factor,useSIFT=useSIFT)
-                total+=len(GCPs)
-                if len(GCPs)>0 and dist_threshold>0:
-                    GCPs=filter_GCP_by_map_proximity(GCPs,slave_geo,dist_threshold)
-                    print('Found %s valid GPCs'%np.asarray(GCPs)[:,0].shape)
-                    distance+=float(np.asarray(GCPs)[:,0].size)
-                for GCP in np.asarray(GCPs).tolist():
-                    GCP_region.append(GCP)
-            if len(GCP_region) > 0:
+                gcps = find_gcps(master_scaled,
+                                 slave_scaled,
+                                 master_window_geo,
+                                 ul_offset=(upper_row, upper_col),
+                                 match_factor=match_factor,
+                                 use_sift=use_sift)
+                total += len(gcps)
+                print(f'Found {total} valid GPCs')
+                if len(gcps) > 0 and dist_threshold > 0:
+                    gcps = filter_gcp_by_translation(gcps, slave_geo, dist_threshold)
+                    print(f'Got {len(gcps)} valid GPCs with a translation lower than {dist_threshold}m')
+                    distance += len(gcps)
+
+                for gcp in gcps:
+                    gcp_region.append(gcp)
+
+            if len(gcp_region) > 0:
                 if angle_threshold > 0:
                     # Filter GCPs based on angular deviations from the mean translation direction
-                    GCP_region=filter_GCP_by_azimuth(GCP_region,slave_geo,angle_threshold)
-                    print('Filtered by angle %s GPCs'%GCP_region[:,0].shape)
-                    azimuth+=float(GCP_region[:,0].size)
-                if filter_intersect:
-                    #Filter GCPs based on whether they intersec with other GCPs   
-                    GCP_region=filter_GCP_by_intersection(GCP_region,slave_geo)
-                    print('Found %s GCPs that do not intersect' %(len(GCP_region)))
-                    intersect+=len(GCP_region)
+                    gcp_region = filter_gcp_by_azimuth(gcp_region, slave_geo, angle_threshold)
+                    print(f'Filtered {len(gcp_region)} GPCs by angular theshold')
+                    azimuth += len(gcp_region)
+
                 if pixel_threshold > 0:
                     # Filter GCPs based on image proximity
-                    GCP_region=filter_GCP_by_GCP_proximity(GCP_region,pixel_threshold)
-                    print('Found %s GCPs separated enough' %(len(GCP_region)))
-                    proximity+=len(GCP_region)
-                for GCP in np.asarray(GCP_region).tolist():
-                    GCP_valid.append(tuple(GCP))
+                    gcp_region = filter_gcp_by_gcp_proximity(gcp_region, pixel_threshold)
+                    print(f'Got {len(gcp_region)} GCPs separated enough')
+                    proximity += len(gcp_region)
 
-    nGCPs={'total':total,'distance':distance,'azimuth':azimuth,'intersect':intersect,'proximity':proximity}   
-    if std_translation_thres > 0:                
-        # Filter GCPs by removing outliers in the tranlation distance between source and destination
-        GCP_valid=filter_GCP_by_tranlation(GCP_valid,slave_geo,stdThres=std_translation_thres)
-        print('Filtered %s GCPs with normal tranlation' %(len(GCP_valid))) 
-        nGCPs['tranlation']=len(GCP_valid)
-   
+                for gcp in np.asarray(gcp_region).tolist():
+                    gcp_valid.append(tuple(gcp))
+
+    n_gcps = {'total': total, 'distance': distance, 'azimuth': azimuth,
+              'proximity': proximity}
+
+    print(f"Got {proximity} candidate GCPs for the whole scene")
+
+    if filter_intersect:
+        # Filter GCPs based on whether they intersec with other GCPs
+        gcp_valid = filter_gcp_by_intersection(gcp_valid, slave_geo)
+        print(f'Got {len(gcp_valid)} GCPs that do not intersect')
+        n_gcps["intersect"] = len(gcp_valid)
+
     # Remove GCPs with exactly the same map coordinates
-    GCP_valid=filter_GCP_by_unique_coordinates(GCP_valid)
-    print('Filtered %s GCPs with same coordinates' %(len(GCP_valid))) 
-    nGCPs['coordinates']=len(GCP_valid)
+    gcp_valid = filter_gcp_by_unique_coordinates(gcp_valid)
+    print(f'Got {len(gcp_valid)} GCPs having different coordinates')
+    n_gcps['coordinates'] = len(gcp_valid)
 
-    print(nGCPs)
-    
+    if warp_threshold > 0:
+        # Filter GCPs based on whether they intersec with other GCPs
+        gcp_valid = filter_gcp_by_warp_error(gcp_valid, warp_threshold)
+        print(f'Got {len(gcp_valid)} GCPs with a warp error lower than {warp_threshold}m')
+        n_gcps["warp"] = len(gcp_valid)
+
+
     # Add manual GCPs
-    if manual_GCP_file:
-        GCP_valid=np.asarray(GCP_valid)[:,:4]
-        GCP_valid=ASCII_to_GCP(manual_GCP_file,GCP=GCP_valid.tolist())
-    slaveXCoord,slaveYCoord=get_map_coordinates(np.asarray(GCP_valid)[:,2],np.asarray(GCP_valid)[:,3],slave_geo)
-    
-    if not exists(outdir+'/GCPs/'):
-        os.mkdir(outdir+'/GCPs/')
-    outshapefile=outdir+'/GCPs/'+basename(output_file)[:-4]+'_Transform.shp'
-    write_transformation_vector((slaveXCoord,slaveYCoord),(np.asarray(GCP_valid)[:,0],np.asarray(GCP_valid)[:,1]),outshapefile,slave_prj)
-    
+    if manual_gcp_file:
+        print(f"Adding manual GCPs")
+        gcp_valid = np.asarray(gcp_valid)[:, :4]
+        gcp_valid = ascii_to_gcp(manual_gcp_file, gcps=gcp_valid.tolist())
+
+    slave_xcoord, slave_yCoord = img.get_map_coordinates(np.asarray(gcp_valid)[:, 2],
+                                                         np.asarray(gcp_valid)[:, 3],
+                                                         slave_geo)
+
+    if not (outdir / "GCPs").is_dir():
+        (outdir / "GCPs").mkdir(parents=True)
+
+    outshapefile = outdir / 'GCPs' / f"{output_file.name[:-4]}_Transform.shp"
+    _write_transformation_vector((slave_xcoord, slave_yCoord),
+                                 (np.asarray(gcp_valid)[:, 0], np.asarray(gcp_valid)[:, 1]),
+                                 outshapefile,
+                                 slave_prj)
+
     # Write the GCP to ascii file
-    outtxtfile=outdir+'/GCPs/'+basename(output_file)[:-4]+'_GCPs.txt'    
-    GCPs_to_ASCII(GCP_valid,outtxtfile)
+    outtxtfile = outdir / 'GCPs' / f"{output_file.name[:-4]}_GCPs.txt"
+    gcps_to_ascii(gcp_valid, outtxtfile)
     # Reproject image
-    if image_to_georreference:
-        slave_file=image_to_georreference
-    warp_image_with_GCPs(slave_file,GCP_valid,output_extent,transform=transform,
-                             subsetBands=bands_to_georreference,outfile=output_file)
+    if image_to_georeference:
+        slave_file = image_to_georeference
 
-def georref_image(master_file, slave_file, output_file, slave_bands=None, noData=0,
-                    pixel_threshold=20, 
-                    manual_GCP_file=None, transform=0,
-                    useSIFT=True, match_factor=0.75,image_to_georreference=None, bands_to_georreference=None,
-                    resolution=None):
-    outdir=dirname(output_file)
-    # Read the master TIR mosaic
-    masterfid=gdal.Open(master_file,gdal.GA_ReadOnly)
-    master_geo=masterfid.GetGeoTransform()
-    masterXsize=masterfid.RasterXSize
-    masterYsize=masterfid.RasterYSize
-    
-    # Set the extent for the output image equal as the master image
-    xmin,ymax=get_map_coordinates(0,0,master_geo)
-    xmax,ymin=get_map_coordinates(masterYsize,masterXsize,master_geo)
-    output_extent=(xmin,ymin,xmax,ymax)
+    warp_image_with_gcps(slave_file,
+                         gcp_valid,
+                         output_file,
+                         output_extent=None,
+                         src_no_data=slave_no_data,
+                         transform=transform,
+                         data_type=gdal.GDT_Float32,
+                         subset_bands=bands_to_georeference)
+
+def warp_image_with_gcps(input_file,
+                         gcp_list,
+                         outfile,
+                         output_extent=None,
+                         src_no_data=0,
+                         subset_bands=None,
+                         transform=0,
+                         data_type=gdal.GDT_UInt16,
+                         resolution=None):
+    """
+    Warps an image following a list of Ground Control Points.
+
+    Parameters
+    ----------
+    input_file : str or Path object
+        Path to the input GDAL compatible image that will be georeferenced/warped.
+    gcp_list : list of tuples
+        List of GCPs, with tuples of map and image coordinates (x, y, row, col).
+    outfile : str or Path object
+        Path to the output georreferenced image.
+    output_extent : list or tuple, optional
+        Bounds in georreferenced units (xmin, ymin, xmax, ymax).
+        If None the extent will be computed by GDAL Warp.
+    src_no_data : float, optional
+        NoData value for the input image
+    subset_bands : list, optional
+        List of bands of `input_file` that will be georeferenced.
+        If None all bands of `input_file` will be used.
+    transform : int, default
+        Transformation method to use.
+        If `transform=0` a Thin Plate Spline transformation will be used.
+        Use with caution unless homogeneous, high quality and dense enough GCPs are obtained,
+        otherwise severe distortions might occur.
+        Set a positive value instead for a polynomial transformation of order equal to such value.
+    data_type : int, optional
+        GDAL output data type, see more info at https://naturalatlas.github.io/node-gdal/classes/Constants%20(GDT).html
+        Default: Unsigned 16bit
+    resolution : tuple, optional
+        Output image resolution (xres, yres) in georrefenced units.
+        If None the resolution of the `input_image` will be used.
+
+    Returns
+    -------
+    None
+    """
+    infid = gdal.Open(str(input_file), gdal.GA_ReadOnly)
+    prj = infid.GetProjection()
     if not resolution:
-       resolution= master_geo[1],master_geo[5]
-    
-    slavefid=gdal.Open(slave_file,gdal.GA_ReadOnly)
-    if slave_bands==None:
-        slave_bands= range(slavefid.RasterCount)
-    # Create the empty list with valid GCPs and count for valid GCPs
-    GCP_valid=[]
-    total=0
-    distance=0
-    azimuth=0
-    intersect=0
-    proximity=0
-    master_scaled=masterfid.GetRasterBand(1).ReadAsArray().astype(np.float)
-    master_scaled=scale_grayscale_image(master_scaled, noData=noData)
-    GCP_region=[]
-    for band in slave_bands:
-        slave_scaled=slavefid.GetRasterBand(band+1).ReadAsArray().astype(np.float)
-        if slave_scaled.any() == noData: # If all pixels have no data skip tile
-            continue
-        slave_scaled=scale_grayscale_image(slave_scaled, noData=noData)
-        if np.any(slave_scaled)==0:
-            continue
-        # Find features and matches
-        GCPs=find_GCPs(master_scaled,slave_scaled,master_geo,
-                            match_factor=match_factor,useSIFT=useSIFT)
-        total+=len(GCPs)
-        for GCP in np.asarray(GCPs).tolist():
-            GCP_region.append(GCP)
-    if len(GCP_region) > 0:
-        if pixel_threshold > 0:
-            # Filter GCPs based on image proximity
-            GCP_region=filter_GCP_by_GCP_proximity(GCP_region,pixel_threshold)
-            print('Found %s GCPs separated enough' %(len(GCP_region)))
-            proximity+=len(GCP_region)
-        for GCP in np.asarray(GCP_region).tolist():
-            GCP_valid.append(tuple(GCP))
-
-    nGCPs={'total':total,'distance':distance,'azimuth':azimuth,'intersect':intersect,'proximity':proximity}   
-   
-    # Remove GCPs with exactly the same map coordinates
-    GCP_valid=filter_GCP_by_unique_coordinates(GCP_valid)
-    print('Filtered %s GCPs with same coordinates' %(len(GCP_valid))) 
-    nGCPs['coordinates']=len(GCP_valid)
-
-    print(nGCPs)
-    
-    # Add manual GCPs
-    if manual_GCP_file:
-        GCP_valid=np.asarray(GCP_valid)[:,:4]
-        GCP_valid=ASCII_to_GCP(manual_GCP_file,GCP=GCP_valid.tolist())
-    
-    if not exists(outdir+'/GCPs/'):
-        os.mkdir(outdir+'/GCPs/')
-    # Write the GCP to ascii file
-    outtxtfile=outdir+'/GCPs/'+basename(output_file)[:-4]+'_GCPs.txt'    
-    GCPs_to_ASCII(GCP_valid,outtxtfile)
-    # Reproject image
-    if image_to_georreference:
-        slave_file=image_to_georreference
-    warp_image_with_GCPs(slave_file,GCP_valid,output_extent,transform=transform,
-                             subsetBands=bands_to_georreference,outfile=output_file,
-                             resolution=resolution)
-
-def scale_grayscale_image(image, noData=None):
-    
-    if noData==None:
-        index=np.ones(image.shape,dtype=np.bool)
+        geo = infid.GetGeoTransform()
+        xres, yres = geo[1], geo[5]
     else:
-        index=image!=noData
-    if np.sum(index)>30:
-        image[index]= 255*((image[index]-np.amin(image[index]))/(np.amax(image[index])-np.amin(image[index])))
-        image=image.astype(np.uint8)
-        image=cv2.equalizeHist(image.astype(np.uint8))
-    else:
-        image*=0
-    return image
+        xres, yres = resolution
 
-def get_map_coordinates(row,col,geoTransform):
-    X=geoTransform[0]+geoTransform[1]*col+geoTransform[2]*row
-    Y=geoTransform[3]+geoTransform[4]*col+geoTransform[5]*row
-    return X,Y
-
-def get_pixel_coordinates(X,Y,geoTransform):
-    row=(Y - geoTransform[3]) / geoTransform[5]
-    col=(X - geoTransform[0]) / geoTransform[1]
-    return row,col
-
-def compute_PCA(imageFile,pcaComponents=None,outfile=None,bandsPCA=None,normalize=False):
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    #from sknn.platform import gpu32
-    
+    rows = infid.RasterYSize
+    cols = infid.RasterXSize
     driver = gdal.GetDriverByName('GTiff')
-    
-    fid=gdal.Open(imageFile,gdal.GA_ReadOnly)
-    if bandsPCA:    
-        bands=list(bandsPCA)
-        nbands=len(bands)
-    else:
-        nbands=fid.RasterCount
-        bands=range(nbands)
-    if not pcaComponents:
-        pcaComponents=nbands
-    cols=fid.RasterXSize
-    rows=fid.RasterYSize
-    hyper_geo=fid.GetGeoTransform()
-    hyper_prj=fid.GetProjection()
-    input_array=np.zeros((rows*cols,nbands))
-    for i,band in enumerate(bands):
-        print('Reading hyperspectral band %s'%band)
-        array=fid.GetRasterBand(band+1).ReadAsArray()
-        mask=array>0
-        if normalize:
-            scalerInput=StandardScaler()
-            scalerInput.fit(array[array>0].reshape(-1,1))
-            input_array[:,i]=scalerInput.transform(array.reshape(-1,1)).reshape(-1)
-            input_array[:,i]*=mask.reshape(-1)
-        else:
-            input_array[:,i]=array.reshape(-1)
-        del array
-    del fid
-    pca = PCA(n_components=pcaComponents)
-    input_array=np.ma.masked_array(input_array,mask=input_array==0)
-    pca.fit(input_array)
-    print('Explained variance per component,'+str(pca.explained_variance_ratio_))
-    print('Explained variance total,'+str(np.sum(np.asarray(pca.explained_variance_ratio_))))
-    
-    output_array=pca.transform(input_array)*mask.reshape(-1,1)
-    output_array=output_array.reshape((rows,cols,pcaComponents))
-    if outfile:
-        ds = driver.Create(outfile, cols, rows ,pcaComponents, gdal.GDT_Float32)
-        ds.SetGeoTransform(hyper_geo)
-        ds.SetProjection(hyper_prj)
-        for band in range(pcaComponents):
-            ds.GetRasterBand(band+1).WriteArray(output_array[:,:,band])
-            ds.FlushCache()
-        del ds
-    
-    return output_array,pca.explained_variance_ratio_
+    tempfile = input_file.parent / 'temp.tif'
+    if tempfile.exists():
+        [os.remove(i) for i in Path(input_file.name.rstrip(".")[0]).glob('.*')]
 
-def warp_image_with_GCPs(input_file,GCP_list,output_extent=None,subsetBands=None,transform=0, outfile=None, data_format=2, resolution=None):
-    from os.path import exists,dirname, splitext
-    from glob import glob
-    from os import remove
-    import subprocess
-    
-    GDALGCPs=create_gdal_GCPs(GCP_list)  
-    
-    infid=gdal.Open(input_file,gdal.GA_ReadOnly)
-    prj=infid.GetProjection()
-    if not resolution:
-        geo=infid.GetGeoTransform()
-        xres,yres=geo[1],geo[5]
-    else:
-        xres,yres=resolution
-    
-    rows=infid.RasterYSize
-    cols=infid.RasterXSize
-    driver = gdal.GetDriverByName('GTiff')
-    tempfile=dirname(input_file)+'/temp.tif'
-    if exists(tempfile): 
-        [remove(i) for i in glob(splitext(tempfile)[0]+'.*')]
-    if not output_extent:
-        xmin_out,ymax_out=get_map_coordinates(0,0,geo)
-        xmax_out,ymin_out=get_map_coordinates(rows,cols,geo)
-        output_extent=(xmin_out,ymin_out,xmax_out,ymax_out)
 
-    nbands=infid.RasterCount
-    if subsetBands==None:
-        subsetBands=range(1,nbands+1)
-    nbands=len(subsetBands)
-    ds = driver.Create(tempfile, cols, rows, nbands, data_format)
-    for i,band in enumerate(subsetBands):
-        print('Saving Band ' +str(band))
-        array=infid.GetRasterBand(band).ReadAsArray()
-        band=ds.GetRasterBand(i+1)
+    nbands = infid.RasterCount
+    if not subset_bands:
+        subset_bands = range(nbands)
+
+    nbands = len(subset_bands)
+    ds = driver.Create(str(tempfile), cols, rows, nbands, data_type)
+    for i, band in enumerate(subset_bands):
+        print('Saving Band ' + str(band))
+        array = infid.GetRasterBand(band + 1).ReadAsArray()
+        band = ds.GetRasterBand(i + 1)
         band.WriteArray(array)
-        band.SetNoDataValue(0)
-        #band.FlushCache()
-        del band
-        del array
+        band.SetNoDataValue(src_no_data)
+        band.FlushCache()
+        del band, array
+
     del infid
-    ds.SetGCPs(GDALGCPs,prj)
+    gcp_list = _create_gdal_gcps(gcp_list)
+    ds.SetGCPs(gcp_list, prj)
     ds.SetProjection(prj)
     ds.FlushCache()
     del ds
     # Run GDAL Warp
     if not outfile:
-        outfile=input_file[:-4]+'_Georref.bsq'
-    if exists(outfile):
-        [remove(i) for i in glob(splitext(outfile)[0]+'.*')]
-    if transform==0:
-        gdal_command='gdalwarp -tps -overwrite -r bilinear -of ENVI -srcnodata 0 -dstnodata 0 -multi -tr %s %s '%(xres,yres) +' -te %s %s %s %s '%output_extent+' "'+ tempfile + '" "'  + outfile +'"'
+        outfile = input_file.name.rstrip(".")[0] + '_Georef.tif'
+
+    if outfile.exists():
+        [os.remove(i) for i in Path(input_file.name.rstrip(".")[0]).glob('.*')]
+
+    warp_opts = {"outputBounds": output_extent, "xRes": xres, "yRes": yres,
+                 "resampleAlg": "bilinear", "srcNodata": src_no_data, "dstNodata": 0,
+                 "multithread": True}
+
+    if transform == 0:
+        warp_opts["tps"] = True
+
     else:
-        gdal_command='gdalwarp -order ' +str(transform)+' -overwrite -r bilinear -of ENVI -srcnodata 0 -dstnodata 0 -multi -tr %s %s '%(xres,yres) +' -te %s %s %s %s '%output_extent+' "'+ tempfile + '" "'  + outfile +'"'
-    print(gdal_command)
-    proc=subprocess.Popen(gdal_command,shell=True,stdout=subprocess.PIPE,
-         stdin=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
-    while True:
-        out = proc.stdout.read(1)
-        if out == '' and proc.poll() != None:
-        	break
-        if out != '':
-            print(out,end='')
-    proc.communicate()
-    remove(tempfile)
-    return True
+        warp_opts["polynomialOrder"] = transform
 
-def find_GCPs(masterImage,slaveImage,masterGeo,UL_offset=(0,0),match_factor=0.75,useSIFT=False):
+    gdal.Warp(str(outfile), str(tempfile), **warp_opts)
+    os.remove(tempfile)
 
-    GCP_list=[]
+
+def find_gcps(master_image,
+              slave_image,
+              master_gt,
+              ul_offset=(0, 0),
+              match_factor=0.75,
+              use_sift=False):
+    """
+    Find potential GCPs between two images by finding and matching features.
+
+    Parameters
+    ----------
+    master_image : 2D-array
+        Image or subset array that will be use as reference or master
+    slave_image : 2D-array
+        Image or subset array that will be collocated over the master
+    master_gt : list or tuple
+        GDAL geotransform for the master image
+    ul_offset : tuple
+        Offset, in pixel units, to the upper left slave image coordinate when using a subset of the slave image
+    match_factor : float
+        Ratio test filter, as explained by [Lowe2004]_. Set a lower value for more restrictive match search,
+        but fewer potential GCPs
+        If match_factor=0 only best matches will be selected [CV2docs]_.
+    use_sift : bool
+        Flag whether to use SIFT detector and descriptor [Lowe2004]_.
+        If use_sift=False it will use ORB detector and descriptor [Rublee2011]_.
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of GCPs, with tuples of map and image coordinates (x, y, row, col)
+
+    References
+    ----------
+    ..[Lowe2004] Lowe, D.G. Distinctive Image Features from Scale-Invariant Keypoints.
+        International Journal of Computer Vision 60, 91–110 (2004).
+        DOI: 10.1023/B:VISI.0000029664.99615.94.
+    ..[CV2docs] <https://docs.opencv.org/4.x/dc/dc3/tutorial_py_matcher.html>.
+    ..[Rublee2011] Ethan Rublee, Vincent Rabaud, Kurt Konolige, and Gary Bradski.
+        Orb: an efficient alternative to sift or surf.
+        In Computer Vision (ICCV), 2011 IEEE International Conference on, pages 2564–2571. IEEE, 2011.
+    """
+    gcp_list = []
     # Create the feature detector/descriptor and matching objects
-    if useSIFT==True:
+    if use_sift:
         # Initiate SIFT detector
-        detector = cv2.xfeatures2d.SIFT_create()
-        # FLANN parameters for SIFT
-        FLANN_INDEX_KDTREE = 2
-        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-        search_params = dict(checks=50)   # or pass empty dictionary
-        
+        detector = cv2.SIFT_create()
+        # We use NORM distance measurement for SIFT
+        norm_type = cv2.NORM_L1
     else:
-        detector=cv2.ORB_create()
-        FLANN_INDEX_LSH = 6
-        index_params= dict(algorithm = FLANN_INDEX_LSH,
-                   table_number = 12, # 12
-                   key_size = 20,     # 20
-                   multi_probe_level =2) #2
-        search_params = dict(checks=50)   # or pass empty dictionary
-    
-    matcher = cv2.FlannBasedMatcher(index_params,search_params)
-    # Finde features and their descriptors
-    kp_master, des_master = detector.detectAndCompute(masterImage,None)
-    kp_slave, des_slave = detector.detectAndCompute(slaveImage,None)
+        # Initiate ORB detector
+        detector = cv2.ORB.create()
+        norm_type = cv2.NORM_HAMMING
+
+    # Find features and their descriptors
+    kp_master, des_master = detector.detectAndCompute(master_image, None)
+    kp_slave, des_slave = detector.detectAndCompute(slave_image, None)
     if len(kp_master) < 2 or len(kp_slave) < 2:
-        return GCP_list
-    # Get the 2 best matches per feature
-    matches = matcher.knnMatch(des_master,des_slave,k=2)
-    GCP_id=0
-    GCP_list=[]
-    for i,m_n in enumerate(matches):
-        if len(m_n) != 2:
+        return gcp_list
+
+    # We use Brute Force algorithm to find matches
+    if match_factor > 0:
+        cross_check = False
+        matcher = cv2.BFMatcher(norm_type)
+        # Get the 2 best matches per feature
+        matches = matcher.knnMatch(des_master, des_slave, k=2)
+
+        for i, (m, n) in enumerate(matches):
+            if m.distance < match_factor * n.distance:
+                master_pt = np.float32(kp_master[m.queryIdx].pt)
+                x_master, y_master = img.get_map_coordinates(float(master_pt[1]),
+                                                             float(master_pt[0]),
+                                                             master_gt)
+
+                slave_pt = np.float32(kp_slave[m.trainIdx].pt)
+                gcp_list.append((x_master,
+                                 y_master,
+                                 ul_offset[0] + float(slave_pt[1]),
+                                 ul_offset[1] + float(slave_pt[0])))
+
+    else:
+        matcher = cv2.BFMatcher(norm_type, crossCheck=True)
+        matches = matcher.match(des_master, des_slave)
+        for i, m in enumerate(matches):
+            master_pt = np.float32(kp_master[m.queryIdx].pt)
+            x_master, y_master = img.get_map_coordinates(float(master_pt[1]),
+                                                         float(master_pt[0]),
+                                                         master_gt)
+
+            slave_pt = np.float32(kp_slave[m.trainIdx].pt)
+            gcp_list.append((x_master,
+                             y_master,
+                             ul_offset[0] + float(slave_pt[1]),
+                             ul_offset[1] + float(slave_pt[0])))
+
+    return gcp_list
+
+
+def filter_gcp_by_translation(gcps, slave_gt, dist_thres):
+    """ Remove GCPs which translation distance is too large
+
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+    slave_gt : tuple or list
+        GDAL geotransform for the slave image
+    dist_thres : float
+        Maximum translation distance, in destination georrefence units, allowed for each GCP
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+    gcps = np.asarray(gcps)
+    if len(gcps.shape) == 1:
+        gcps = gcps.reshape(1, -1)
+    x_slave, y_slave = img.get_map_coordinates(gcps[:, 2], gcps[:, 3], slave_gt)
+    dist = np.sqrt((x_slave - gcps[:, 0]) ** 2 + (y_slave - gcps[:, 1]) ** 2)
+    gcps = gcps[dist <= dist_thres]
+    return gcps.tolist()
+
+
+def filter_gcp_by_gcp_proximity(gcps, pixel_thres):
+    """ Remove GCPs are two proximal to other GCPs
+
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+    pixel_thres : float
+        Minimum distance in pixel units allowed between two GCPs
+
+    Returns
+    -------
+    gcps_good : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+    gcps_good = []
+    for i, gcp_test in enumerate(gcps):
+        good = True
+        if i == len(gcps) - 2:
             continue
-        (m,n) = m_n
-        dist_ratio=m.distance/n.distance
-        if  dist_ratio < match_factor:
-            master_pt=np.float32( kp_master[m.queryIdx].pt)
-            Xmaster,Ymaster = get_map_coordinates(float(master_pt[1]),float(master_pt[0]),masterGeo)
-            slave_pt=np.float32( kp_slave[m.trainIdx].pt)
-            GCP_list.append((Xmaster,Ymaster,UL_offset[0]+float(slave_pt[1]),UL_offset[1]+float(slave_pt[0]),dist_ratio))
-            GCP_id+=1
-    return GCP_list
-    
-def filter_GCP_by_map_proximity(GCPs,slaveGeo,distThres):
-
-    GCPs=np.asarray(GCPs)
-    if len(GCPs.shape)==1:
-        GCPs=GCPs.reshape(1,-1)
-    Xslave,Yslave = get_map_coordinates(GCPs[:,2],GCPs[:,3],slaveGeo)
-    dist=np.sqrt((Xslave-GCPs[:,0])**2+(Yslave-GCPs[:,1])**2)
-    GCPs=GCPs[dist<=distThres]
-    return GCPs
-    
-def filter_GCP_by_GCP_proximity(GCPs,pixelThres):
-
-    # Filter GCPs based on image proximity
-    GCPs_good=[]
-    for i,gcp_test in enumerate(GCPs):
-        good =True
-        if i==len(GCPs)-2: continue
-        for j in range(i+1,len(GCPs)):
-            #print(i,j)
-            dist=np.sqrt((gcp_test[2]-GCPs[j][2])**2+(gcp_test[3]-GCPs[j][3])**2)
-            if dist<pixelThres:# GCPs closer to each other are discarded to avoid overfitting
-                good=False
+        for j in range(i + 1, len(gcps)):
+            dist = np.sqrt((gcp_test[2] - gcps[j][2]) ** 2 + (gcp_test[3] - gcps[j][3]) ** 2)
+            if dist < pixel_thres:  # GCPs closer to each other are discarded to avoid overfitting
+                good = False
                 break
-        if good==True:
-            GCPs_good.append(gcp_test)
+        if good:
+            gcps_good.append(gcp_test)
 
-    return GCPs_good
-
-def filter_GCP_by_intersection(GCPs,slave_geo):
-
-    # Filter GCPs based on image proximity
-    GCPs_good=[]
-    GCPs=np.asarray(GCPs)
-    if len(GCPs.shape)==1:
-        GCPs=GCPs.reshape(1,-1)
-
-    X_slave,Y_slave=get_map_coordinates(GCPs[:,2],GCPs[:,3],slave_geo)
-    obs_vec=(GCPs[:,0]-X_slave,GCPs[:,1]-Y_slave)
-    azimuth=calc_azimuth(obs_vec)
-    cos_azimuth=np.cos(np.radians(azimuth))
-    sin_azimuth=np.sin(np.radians(azimuth))
-    mean_azimuth=np.degrees(np.arctan2(np.mean(sin_azimuth),np.mean(cos_azimuth)))
-    diff=np.abs(calc_azimuth_difference(azimuth,mean_azimuth))
-    indices=diff.argsort()[::-1]
-    for i,index in enumerate(indices):
-        good =True
-        if i==len(indices)-2: continue
-        for j in range(i+1,len(indices)):
-            #print(i,j)
-            intercept=calc_vector_intersection((X_slave[index],Y_slave[index]),(GCPs[index,0],GCPs[index,1]),
-                                             (X_slave[indices[j]],Y_slave[indices[j]]),(GCPs[indices[j],0],GCPs[indices[j],1]))
-            if intercept:# GCPs closer to each other are discarded to avoid overfitting
-                good=False
-                break
-        if good==True:
-            GCPs_good.append(GCPs[index])
-
-    return GCPs_good
-
-def filter_GCP_by_azimuth(GCPs,slave_geo,angleThres):
-
-    # Filter GCPs based on image proximity
-    GCPs=np.asarray(GCPs)
-    if len(GCPs.shape)==1:
-        GCPs=GCPs.reshape(1,-1)
-    X_slave,Y_slave=get_map_coordinates(GCPs[:,2],GCPs[:,3],slave_geo)
-    obs_vec=(GCPs[:,0]-X_slave,GCPs[:,1]-Y_slave)
-    azimuth=calc_azimuth(obs_vec)
-    cos_azimuth=np.cos(np.radians(azimuth))
-    sin_azimuth=np.sin(np.radians(azimuth))
-    mean_azimuth=np.degrees(np.arctan2(np.mean(sin_azimuth),np.mean(cos_azimuth)))
-    diff=np.abs(calc_azimuth_difference(azimuth,mean_azimuth))
-    GCPs_good=GCPs[diff<=angleThres]
-    return GCPs_good
-
-def filter_GCP_by_tranlation(GCPs,slave_geo,stdThres=2):
-
-    # Filter GCPs based on image proximity
-    GCPs=np.asarray(GCPs)
-    if len(GCPs.shape)==1:
-        GCPs=GCPs.reshape(1,-1)
-    X_slave,Y_slave=get_map_coordinates(GCPs[:,2],GCPs[:,3],slave_geo)
-    dist=np.log(np.sqrt((X_slave-GCPs[:,0])**2+(Y_slave-GCPs[:,1])**2))
-    mean_dist=np.mean(dist)
-    std_dist=np.std(dist)
-    GCPs_good=GCPs[dist<=mean_dist+stdThres*std_dist]
-    return GCPs_good
-
-def filter_GCP_by_unique_coordinates(GCPs):
-    GCPs=np.asarray(GCPs)
-    Coord_good=[]
-    GCPs_good=[]
-    for GCP in GCPs:
-        if (GCP[0],GCP[1]) not in Coord_good:
-            Coord_good.append((GCP[0],GCP[1]))
-            GCPs_good.append(GCP)
-    return GCPs_good
-
-def calc_vector_intersection(start1,end1,start2,end2):
-        
-    return _ccw(start1,start2,end2) != _ccw(end1,start2,end2) and _ccw(start1,end1,start2) != _ccw(start1,end1,end2)
-
-def _ccw(A,B,C):
-    return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+    return gcps_good
 
 
-def filter_GCP_by_warp_error(GCPs,errorThres):
-    def fit_polynomial_warp(GCPs):
-    
-        GCPs=np.asarray(GCPs)
-        if GCPs.shape[0]<15:
-            return None,None
-        rows=GCPs[:,2]
-        cols=GCPs[:,3]
-        rows2=rows**2
-        cols2=cols**2
-        rowscols=rows*cols
-        rows2cols=rows**2*cols
-        rowscols2=rows*cols**2
-        rows3=rows**3
-        cols3=cols**3
-        
-        X=np.matrix([np.ones(rows.shape),rows,cols,rowscols,rows2,cols2,rows2cols,rowscols2,rows3,cols3]).T
-        mapX=GCPs[:,0].reshape(-1,1)
-        mapY=GCPs[:,1].reshape(-1,1)
-        thetaX=(X.T*X).I*X.T*mapX    
-        thetaY=(X.T*X).I*X.T*mapY    
-        return np.asarray(thetaX).reshape(-1),np.asarray(thetaY).reshape(-1)
+def filter_gcp_by_intersection(gcps, slave_gt):
+    """ Remove GCPs that have a transformation vector direction
+    significantly different to the average transformation direction
 
-    def calc_warp_erors(GCPs,thetaX,thetaY):
-        def polynomial_warp(rows,cols,thetaX,thetaY):
-        
-            X=thetaX[0]+thetaX[1]*rows+thetaX[2]*cols+thetaX[3]*rows*cols+thetaX[4]*rows**2+thetaX[5]*cols**2+thetaX[6]*rows**2*cols+thetaX[7]*rows*cols**2+thetaX[8]*rows**3+thetaX[9]*cols**3
-            Y=thetaY[0]+thetaY[1]*rows+thetaY[2]*cols+thetaY[3]*rows*cols+thetaY[4]*rows**2+thetaY[5]*cols**2+thetaY[6]*rows**2*cols+thetaY[7]*rows*cols**2+thetaY[8]*rows**3+thetaY[9]*cols**3
-            return X,Y
-    
-        GCPs=np.asarray(GCPs)
-        if len(GCPs.shape)==1:
-            GCPs=GCPs.reshape(1,-1)
-    
-        rows=GCPs[:,2]
-        cols=GCPs[:,3]
-        X_model,Y_model=polynomial_warp(rows,cols,thetaX,thetaY)
-        error=np.sqrt((X_model-GCPs[:,0])**2+(Y_model-GCPs[:,1])**2)
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+    slave_gt : tuple or list
+        GDAL geotransform for the slave image
+    angle_thres : float
+        Maximum angular difference (degrees) from the average transformation direction
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+    gcps_good = []
+    gcps = np.asarray(gcps)
+    if len(gcps.shape) == 1:
+        gcps = gcps.reshape(1, -1)
+
+    else:
+        x_slave, y_slave = img.get_map_coordinates(gcps[:, 2], gcps[:, 3], slave_gt)
+        obs_vec = (gcps[:, 0] - x_slave, gcps[:, 1] - y_slave)
+        azimuth = calc_azimuth(obs_vec)
+        cos_azimuth = np.cos(np.radians(azimuth))
+        sin_azimuth = np.sin(np.radians(azimuth))
+        mean_azimuth = np.degrees(np.arctan2(np.mean(sin_azimuth), np.mean(cos_azimuth)))
+        diff = np.abs(calc_azimuth_difference(azimuth, mean_azimuth))
+        indices = diff.argsort()[::-1]
+        for i, index in enumerate(indices):
+            good = True
+            if i == len(indices) - 2:
+                continue
+            for j in range(i + 1, len(indices)):
+                intercept = _calc_vector_intersection((x_slave[index], y_slave[index]),
+                                                      (gcps[index, 0], gcps[index, 1]),
+                                                      (x_slave[indices[j]], y_slave[indices[j]]),
+                                                      (gcps[indices[j], 0], gcps[indices[j], 1]))
+                if intercept:  # GCPs closer to each other are discarded to avoid overfitting
+                    good = False
+                    break
+            if good:
+                gcps_good.append(gcps[index])
+
+    return gcps_good
+
+
+def _calc_vector_intersection(start1, end1, start2, end2):
+    """
+    Checks whether two segments/vectors instersect each other.
+    Parameters
+    ----------
+    start1 : tuple
+        coordinates (x, y) of starting point of first segment
+    end1 : tuple
+        coordinates (x, y) of ending point of first segment
+    start2 : tuple
+        coordinates (x, y) of starting point of second segment
+    end2 : tuple
+        coordinates (x, y) of ending point of second segment
+
+    Returns
+    -------
+    intersect : bool
+        True if the two segments intersect, False otherwise
+    """
+    def _ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+    intersect = _ccw(start1, start2, end2) != _ccw(end1, start2, end2) \
+                and _ccw(start1, end1, start2) != _ccw(start1, end1, end2)
+    return intersect
+
+
+def filter_gcp_by_azimuth(gcps, slave_gt, angle_thres):
+    """ Remove GCPs that have a transformation vector direction
+    significantly different to the average transformation direction
+
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+    slave_gt : tuple or list
+        GDAL geotransform for the slave image
+    angle_thres : float
+        Maximum angular difference (degrees) from the average transformation direction
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+
+    gcps = np.asarray(gcps)
+    if len(gcps.shape) == 1:
+        gcps = gcps.reshape(1, -1)
+
+    x_slave, y_slave = img.get_map_coordinates(gcps[:, 2], gcps[:, 3], slave_gt)
+    obs_vec = (gcps[:, 0] - x_slave, gcps[:, 1] - y_slave)
+    azimuth = calc_azimuth(obs_vec)
+    cos_azimuth = np.cos(np.radians(azimuth))
+    sin_azimuth = np.sin(np.radians(azimuth))
+    # Compute the mean azimuth transformation direction
+    mean_azimuth = np.degrees(np.arctan2(np.mean(sin_azimuth), np.mean(cos_azimuth)))
+    # Compute the angular differences to the mean direction and filter
+    diff = np.abs(calc_azimuth_difference(azimuth, mean_azimuth))
+    gcps = gcps[diff <= angle_thres]
+    return gcps.tolist()
+
+
+def filter_gcp_by_unique_coordinates(gcps):
+    """ Remove GCPs that have exactly the same destionation coordinates
+
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+    gcps = np.asarray(gcps)
+    coord_good = []
+    gcps_good = []
+    for gcp in gcps:
+        if (gcp[0], gcp[1]) not in coord_good:
+            coord_good.append((gcp[0], gcp[1]))
+            gcps_good.append(gcp)
+    return gcps_good
+
+
+def filter_gcp_by_warp_error(gcps, error_thres):
+    """ Remove GCPs with errors larger than a giving threshold
+    after a fitting a 3-degree polynomial transformation
+
+    Parameters
+    ----------
+    gcps : list of tuple
+        List of GCPs that be evaluated, with tuples of map and image coordinates (x, y, row, col)
+    error_thres : float
+        Maximum error accepted, in georeference units, when fitting the warp polynomial
+        Usually the objective is to have an error of half-pixel,
+        so it is recommended to use one half of the slave pixel resolution
+
+    Returns
+    -------
+    gcps : list of tuple
+        List of filtered GCPs, with tuples of map and image coordinates (x, y, row, col)
+    """
+    def _fit_polynomial_warp(gcps):
+
+        gcps = np.asarray(gcps)
+        if gcps.shape[0] < 15:
+            return None, None
+        rows = gcps[:, 2]
+        cols = gcps[:, 3]
+        rows2 = rows ** 2
+        cols2 = cols ** 2
+        rowscols = rows * cols
+        rows2cols = rows ** 2 * cols
+        rowscols2 = rows * cols ** 2
+        rows3 = rows ** 3
+        cols3 = cols ** 3
+
+        x = np.matrix([np.ones(rows.shape), rows, cols, rowscols, rows2, cols2, rows2cols, rowscols2, rows3, cols3]).T
+        map_x = gcps[:, 0].reshape(-1, 1)
+        map_y = gcps[:, 1].reshape(-1, 1)
+        theta_x = (x.T * x).I * x.T * map_x
+        theta_y = (x.T * x).I * x.T * map_y
+        return np.asarray(theta_x).reshape(-1), np.asarray(theta_y).reshape(-1)
+
+    def _calc_warp_erors(gcps, theta_x, theta_y):
+        def _polynomial_warp(rows, cols, theta_x, theta_y):
+            x = theta_x[0] + theta_x[1] * rows + theta_x[2] * cols + theta_x[3] * rows * cols + theta_x[4] * rows ** 2 + \
+                theta_x[5] * cols ** 2 + theta_x[6] * rows ** 2 * cols + theta_x[7] * rows * cols ** 2 + \
+                theta_x[8] * rows ** 3 + theta_x[9] * cols ** 3
+            y = theta_y[0] + theta_y[1] * rows + theta_y[2] * cols + theta_y[3] * rows * cols + theta_y[4] * rows ** 2 + \
+                theta_y[5] * cols ** 2 + theta_y[6] * rows ** 2 * cols + theta_y[7] * rows * cols ** 2 + \
+                theta_y[8] * rows ** 3 + theta_y[9] * cols ** 3
+            return x, y
+
+        gcps = np.asarray(gcps)
+        if len(gcps.shape) == 1:
+            gcps = gcps.reshape(1, -1)
+
+        rows = gcps[:, 2]
+        cols = gcps[:, 3]
+        x_model, y_model = _polynomial_warp(rows, cols, theta_x, theta_y)
+        error = np.sqrt((x_model - gcps[:, 0]) ** 2 + (y_model - gcps[:, 1]) ** 2)
         return error
 
-    GCPs=np.asarray(GCPs)
-    if GCPs.shape[0]<15:
-        return GCPs
-    thetaX,thetaY=fit_polynomial_warp(GCPs)
-    error=calc_warp_erors(GCPs,thetaX,thetaY)
-    while np.max(error)>errorThres and len(error)>30:
-        index=error.argsort()[::-1]
-        GCPs=GCPs[index[1:]]
-        thetaX,thetaY=fit_polynomial_warp(GCPs)
-        error=calc_warp_erors(GCPs,thetaX,thetaY)
+    gcps = np.asarray(gcps)
+    if gcps.shape[0] < 15:
+        return gcps
 
-    return GCPs
-    
-def calc_azimuth(obs_vec):
+    theta_x, theta_y = _fit_polynomial_warp(gcps)
+    error = _calc_warp_erors(gcps, theta_x, theta_y)
+    while np.max(error) > error_thres and len(error) > 30:
+        index = error.argsort()[::-1]
+        gcps = gcps[index[1:]]
+        theta_x, theta_y = _fit_polynomial_warp(gcps)
+        error = _calc_warp_erors(gcps, theta_x, theta_y)
+
+    return gcps
+
+
+def calc_azimuth(vector):
     ''' Calculates the azimuth navigation heading between two positions
 
     Parameters
     ----------   
-    lon_0, lat_0 : Initial longitude and latitude (degrees)
-    lon_1, lat_1 : Final longitude and latitude (degrees)
+    vector : tuple
+        Vector coordinates (x, y)
     
     Returns
     -------
-    azimuth : Azimutal heading (degrees from North)'''
+    azimuth : float
+        Azimutal heading (degrees from North)'''
 
     # Get the view azimuth angle
-    azimuth = np.degrees(np.arctan2(obs_vec[0],obs_vec[1]))
+    azimuth = np.degrees(np.arctan2(vector[0], vector[1]))
     return azimuth
 
-def calc_azimuth_difference(azimut1,azimut2):
-    ''' Calculates the azimuth navigation heading between two positions
+
+def calc_azimuth_difference(angle_1, angle_2):
+    ''' Calculates the angle difference between two angles
 
     Parameters
     ----------   
-    lon_0, lat_0 : Initial longitude and latitude (degrees)
-    lon_1, lat_1 : Final longitude and latitude (degrees)
+    angle_1 : float or array
+        First angle (degrees)
+    angle_2 : float or array
+        Second angle (degrees)
     
     Returns
     -------
-    azimuth : Azimutal heading (degrees from North)'''
+    angle : Angle difference (degrees)'''
 
     # Get the view azimuth angle
-    azimuth = np.degrees(np.arctan2(np.sin(np.radians(azimut1-azimut2)),np.cos(np.radians(azimut1-azimut2))))
-    return azimuth
+    angle_1 = np.radians(angle_1)
+    angle_2 = np.radians(angle_2)
+    angle = np.degrees(np.arctan2(np.sin(angle_1 - angle_2),
+                                  np.cos(angle_1 - angle_2)))
+    return angle
 
-def create_gdal_GCPs(GCPs):
 
-    gdalGCP=[]
-    for i,gcp in enumerate(GCPs):
-        gdalGCP.append(gdal.GCP(gcp[0], gcp[1],0, gcp[3], gcp[2],'',str(i)))
-    return gdalGCP
+def _create_gdal_gcps(gcps):
+    "Prepares the GCPs to be stored in GDAL format"
+    gdalgcp = []
+    for i, gcp in enumerate(gcps):
+        gdalgcp.append(gdal.GCP(gcp[0], gcp[1], 0, gcp[3], gcp[2], '', str(i)))
+    return gdalgcp
 
-def GCPs_to_ASCII(GCPs,outfile):
 
-    header='ID \t X \t Y \t Row \t Col'
-    fid=open(outfile,'w')
-    fid.write(header+'\n')
-    for i,gcp in enumerate(GCPs):
-        fid.write('%s \t %s \t %s \t %s \t %s \n'%(i,gcp[0],gcp[1],gcp[2],gcp[3]))
+def gcps_to_ascii(gcps, outfile):
+    """ Saves an ASCII file with a list of GCPs.
+
+    Parameters
+    ----------
+    gcps : list of tuples, optional
+        List of GCPs  with tuples of map and image coordinates (x, y, row, col)
+    outfile : str or Path object
+        Output ASCII file, it will contain 5 columns ["ID", "X", "Y", "Row, "Col"]
+        > ID: GCP id
+        > X, Y: destination map coordinates
+        > Row, Col: origin image coordinates
+
+    Returns
+    -------
+    None
+    """
+
+    header = 'ID \t X \t Y \t Row \t Col'
+    fid = open(outfile, 'w')
+    fid.write(header + '\n')
+    for i, gcp in enumerate(gcps):
+        fid.write(f'{i}\t{gcp[0]}\t{gcp[1]}\t{gcp[2]}\t{gcp[3]}\n')
     fid.flush()
     fid.close()
-    return True
+    return
 
-def ASCII_to_GCP(infile,GCP=[]):
 
-    indata=np.genfromtxt(infile,names=True,dtype=None)
+def ascii_to_gcp(infile, gcps=[]):
+    """ Reads ASCII file with GCPs.
+    Optionally adds these GCPs to an exsiting list of GCPs
+
+    Parameters
+    ----------
+    infile : str or Path object
+        Input ASCII file, it must contain at least 4 columns ["Row, "Col", "X", "Y"]
+        > Row, Col: origin image coordinates
+        > X, Y: destination map coordinates
+    gcps : list of tuples, optional
+        List of existing GCPs in which the GCP in the ASCII table will be appended
+
+    Returns
+    -------
+    gcps : list of tuples
+        List of GCPs  with tuples of map and image coordinates (x, y, row, col)
+    """
+    indata = np.genfromtxt(infile, names=True, dtype=None)
+    print(f"Adding {len(indata.tolist())} GCPs from file")
     for data in indata:
-        GCP.append([float(data['X']),float(data['Y']),float(data['Row']),float(data['Col'])])
-    return GCP
+        gcps.append([float(data['X']), float(data['Y']), float(data['Row']), float(data['Col'])])
+    return gcps
 
-def write_transformation_vector(slaveCoords,masterCoords,outshapefile,prj):
-    from osgeo import ogr
-    import osr
-    import os
 
-    DriverName = "ESRI Shapefile"
-    driver = ogr.GetDriverByName(DriverName)
-    if os.path.exists(outshapefile):
-        driver.DeleteDataSource(outshapefile)
-    
-    data_source = driver.CreateDataSource(outshapefile)
+def _write_transformation_vector(slave_coords, master_coords, outshapefile, prj):
+    """
+    Writes a shapefile with the GCP transformation vector in georreferenced units
+
+    Parameters
+    ----------
+    slave_coords
+    master_coords
+    outshapefile
+    prj
+
+    Returns
+    -------
+    None
+    """
+    outshapefile = Path(outshapefile)
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    if outshapefile.exists():
+        driver.DeleteDataSource(str(outshapefile))
+
+    data_source = driver.CreateDataSource(str(outshapefile))
     # create the layer
-    srs=osr.SpatialReference()
+    srs = osr.SpatialReference()
     srs.ImportFromWkt(prj)
     layer = data_source.CreateLayer("Transformation Vectors", srs, ogr.wkbLineString)
 
-    for i,slaveXCoord in enumerate(slaveCoords[0][:]):
+    for i, slave_xCoord in enumerate(slave_coords[0][:]):
         # create the feature
         feature = ogr.Feature(layer.GetLayerDefn())
- 
+
         line = ogr.Geometry(ogr.wkbLineString)
-        line.AddPoint(slaveXCoord,slaveCoords[1][i])
-        line.AddPoint(masterCoords[0][i],masterCoords[1][i])
-          # Set the feature geometry using the point
+        line.AddPoint(slave_xCoord, slave_coords[1][i])
+        line.AddPoint(master_coords[0][i], master_coords[1][i])
+        # Set the feature geometry using the point
         feature.SetGeometry(line)
         # Create the feature in the layer (shapefile)
         layer.CreateFeature(feature)
@@ -681,4 +943,34 @@ def write_transformation_vector(slaveCoords,masterCoords,outshapefile,prj):
         feature.Destroy()
     # Destroy the data source to free resources
     data_source.Destroy()
-    return True
+    return
+
+def split_blocks(array, nblocks):
+    """
+    split 2D array into equal blocks in both vertical and horizontal direction
+    and calculates mean for each block
+
+    Parameters
+    ----------
+    input array: 2D numpy array
+
+    nblocks: int
+        number of blocks to divide array
+
+    Returns
+    -------
+    block_means: numpy array
+        array with mean values for each block
+
+    """
+    # function to split array into equal blocks in both vertical and horizontal direction
+    # and calculate mean for each block
+    block_means = []
+    # split array into equal blocks in axis 0 (i.e. in rows horizontally)
+    ar_split1 = np.array_split(array, nblocks)
+    for ar in ar_split1:
+        # further split array into equal blocks in axis 1 (i.e. in cols vertically)
+        ar_split2 = np.array_split(ar, nblocks, axis=1)
+        block_means += [np.nanmean(ar) for ar in ar_split2]
+
+    return np.array(block_means)
