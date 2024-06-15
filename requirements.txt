@@ -1,7 +1,8 @@
 numpy
 gdal
 pillow
-opencv-contrib-python>=4.3.0
+#opencv-python
+#opencv-contrib-python
 pyproj
 scipy
 scikit-learn
