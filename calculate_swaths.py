@@ -8,7 +8,7 @@ import numpy as np
 from pyTSEB import meteo_utils as met
 import os
 import os.path as pth
-import osr
+from osgeo import osr
 import airborne_tools.save_runs as fp
 
 #==============================================================================
