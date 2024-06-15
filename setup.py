@@ -41,20 +41,11 @@ def read_file(filepath, root=PROJECT_ROOT):
 
 LONG_DESCRIPTION = read_file("README.md")
 SHORT_DESCRIPTION = "Python tools for processing very high resolution imagery onboard an RPAS or an manned aircraft"
-REQS = ['numpy>=1.10',
-        'gdal',
-        'osr',
-        'pillow',
-        'opencv',
-        'pyexiv2',
-        'scipy',
-        'scikit-learn'
-        ]
+
 
 setup(
     name                  = "airborne_tools",
     packages              = ['airborne_tools'],
-    install_requires      = REQS,
     version               = "0.1",
     author                = "Hector Nieto",
     author_email          = "hector.nieto.solana@gmail.com",
