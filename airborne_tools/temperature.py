@@ -1,4 +1,3 @@
-from pathlib import Path
 from osgeo import gdal
 import numpy as np
 from scipy import stats as st
@@ -189,17 +188,3 @@ def component_temperatures(lst_file, vnir_file, vnir_soil, vnir_veg, out_res,
     print("Done")
 
 
-workdir = Path("/home/hector/Nextcloud/SACO/exchange/TSEB-workshop/")
-indir = workdir / "input" / "pyTSEB"
-outdir = workdir / "output"
-
-lst_file = indir / "SLM_001_002_20140809_1041_TIR.tif"
-ndvi_file = indir / "SLM_001_002_20140809_1041_NDVI.tif"
-
-out_file = outdir / "SLM_001_002_20140809_1041_TC-TS.tif"
-out_res = 3.6
-ndvi_soil = 0.3
-ndvi_veg = 0.6
-
-component_temperatures(lst_file, ndvi_file, ndvi_soil, ndvi_veg, out_res,
-                       out_file)
