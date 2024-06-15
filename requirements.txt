@@ -1,0 +1,8 @@
+numpy
+gdal
+pillow
+opencv-contrib-python
+pyproj
+scipy
+scikit-learn
+pyexiv2
