@@ -6,3 +6,4 @@ pyproj
 scipy
 scikit-learn
 pyexiv2
+pytseb @ git+https://github.com/hectornieto/pyTSEB
