@@ -1,0 +1,54 @@
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airborne_tools"
+version = "0.1.0"
+description = "Python tools for processing very high resolution imagery onboard an RPAS or an manned aircraft"
+authors = [
+    { name = "Héctor Nieto", email = "hector.nieto@csic.es" },
+    { name = "Vicente Burchard Levine", email = "vburchard@ica.csic.es"}
+]
+
+maintainers = [
+    { name = "Héctor Nieto", email = "hector.nieto@csic.es" }
+]
+
+keywords = ['UAV',
+            'RPAS',
+            'Georeferencing',
+            'Ground Control Points',
+            'Remote Sensing']
+
+classifiers  = [
+        "Development Status :: Beta",
+        "Intended Audience :: Science/Research",
+        "Topic :: Scientific/Engineering :: Agricultural Science",
+        "Topic :: Scientific/Engineering :: Remnote Sensing",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+        "Programming Language :: Python",
+        "Programming Language :: Python :: 3"]
+        
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.6"
+dependencies = ["numpy",
+                "gdal",
+                "pillow",
+                "opencv-python",
+                "opencv-contrib-python",
+                "pyproj",
+                "scipy",
+                "scikit-learn",
+                "pyexiv2",
+                "pytseb"]
+
+[project.urls]
+Homepage = "https://github.com/hectornieto/airborne_tools"
+
+[tool.setuptools]
+packages = ["airborne_tools"]
+
