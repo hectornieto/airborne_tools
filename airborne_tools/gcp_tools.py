@@ -181,8 +181,8 @@ def collocate_image(master_file,
             lr_master_row = int(np.clip(lr_master_row, 0, master_ysize))
             lr_master_col = int(np.clip(lr_master_col, 0, master_xsize))
 
-            win_master_xsize = int(lr_master_col - ul_master_col)
-            win_master_ysize = int(lr_master_row - ul_master_row)
+            win_master_xsize = abs(int(lr_master_col - ul_master_col))
+            win_master_ysize = abs(int(lr_master_row - ul_master_row))
             # Read the master image array and subset
             master_scaled = masterfid.GetRasterBand(1).ReadAsArray(ul_master_col,
                                                                    ul_master_row,
